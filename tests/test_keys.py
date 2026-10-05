@@ -191,8 +191,28 @@ def test_scanner_ignores_env_references_and_redaction_markers():
         'kwargs = {"model": "anthropic/glm-5.3", "api_key": "<REDACTED>"}',
         "return f\"api_key: {decoy_key()}\"",
         "rule name: provider-key-shaped",
+        # callable reference: resolves the key at runtime, holds no literal
+        "api_key=token_plan_key(),",
+        '"api_key": keys.token_plan_key(),',
+        "llm = LLM(model=model, api_key=token_plan_key(), base_url=base_url)",
+        "api_key  = keys.token_plan_key()   # env var, else config.yaml",
     ]:
         assert secret_scan.scan_line(benign, {}) is None, benign
+
+
+def test_callable_exception_cannot_hide_a_literal_secret():
+    """The 'name followed by (' carve-out must not become a loophole."""
+    literal = _P1 + "9Qz7W" + "erp4Xk2" + "8Nm3Bd"
+    # literal secret glued to a call: shape rule still fires
+    assert secret_scan.scan_line(f"api_key={literal}token_plan_key()", {}) == \
+        "provider-key-shaped"
+    # a REAL key is caught regardless of what follows it
+    live = {"token_plan": literal}
+    assert secret_scan.scan_line(f"api_key = {literal} (", live) == "real-key:token_plan"
+    # bare identifier with no parens is still treated as a literal assignment.
+    # Built at runtime so this test file commits no credential-shaped literal.
+    bare = "api_key = " + "token_plan_value_xyz7" + "89"
+    assert secret_scan.scan_line(bare, {}) == "kv-assignment"
 
 
 def test_scanner_passes_over_the_repo_as_committed():

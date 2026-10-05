@@ -154,8 +154,7 @@ def scan_line(line: str, live: dict[str, str] | None = None) -> str | None:
     """Return the rule name if this line leaks, else ``None``.
 
     Order matters: the live-key substring test runs FIRST, so a real key can
-    never be forgiven by the placeholder allowlist (a real key that happens to
-    contain the word "example" still fails).
+    never be forgiven by the allowlist or by the callable exception below.
     """
     live = live or {}
     hit = _real_key_hit(line, live)
@@ -167,6 +166,15 @@ def scan_line(line: str, live: dict[str, str] | None = None) -> str | None:
             token = token.strip("\"'`,;)}")
             if not token:
                 continue
+            # ``api_key=<name>(`` is a *reference* -- a function call resolving
+            # the credential at runtime, which is exactly the pattern lib/keys.py
+            # mandates. Only the name-based rule relaxes for it: a literal secret
+            # is still caught above (live-key) or by the shape rules, none of
+            # which can match a bare identifier followed by "(".
+            if rule == "kv-assignment":
+                rest = line[match.end():]
+                if rest.lstrip()[:1] == "(":
+                    continue
             if looks_allowable(token):
                 continue
             return rule
