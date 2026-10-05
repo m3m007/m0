@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.log
+runs/
+*.bak
+.pytest_cache/
+**/raw_responses/*.json
+!**/raw_responses/*.redacted.json
+.env

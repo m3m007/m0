@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "multiagent-stack"
+version = "0.1.0"
+description = "Robust multi-agent dev stack on existing Token Plan (main) + Kimi (backup) subscriptions."
+requires-python = ">=3.11"
+# Runtime deps are the ones already present in the shared venv
+# (/home/hermes/.hermes/cache/scratch/oh-venv). Nothing here installs anything:
+# openhands-sdk==1.51.0 / openhands-tools==1.51.0 / litellm==1.104.0 / PyYAML /
+# pytest / jsonschema are all preinstalled, and a version-skewed SDK+tools pair
+# breaks imports, so the pins below are documentation, not a request to pip.
+dependencies = [
+    "PyYAML>=6",
+]
+
+[project.optional-dependencies]
+team = [
+    "openhands-sdk==1.51.0",
+    "openhands-tools==1.51.0",
+    "litellm>=1.104,<2",
+]
+dev = [
+    "pytest>=8",
+    "jsonschema>=4",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+markers = [
+    "live: touches a real paid endpoint (deselected unless LIVE=1)",
+    "slow: multi-turn agent run, minutes not seconds",
+]
+filterwarnings = ["ignore::DeprecationWarning"]
+
+[tool.setuptools]
+packages = ["lib", "router", "fix", "team"]
