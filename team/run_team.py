@@ -210,6 +210,18 @@ class Team:
                 f"{self._requests} already spent. Stopping before the spend.")
         self._requests += n
 
+    def _settle(self, actual: int) -> None:
+        """Reconcile the 1-request reservation with the completions that happened.
+
+        ``_charge`` reserves one request before the send (a task may take
+        several turns); this adds the remainder. It deliberately does NOT raise:
+        by now the requests are already spent, and raising here would mark a
+        task that actually succeeded as failed and throw away its result. The
+        ceiling is instead enforced at the next task boundary, in _charge.
+        """
+        if actual > 1:
+            self._requests += actual - 1
+
     # -- construction ---------------------------------------------------
     def role_for(self, name: str) -> str:
         """Map a role-file name onto a router role name."""
@@ -336,10 +348,13 @@ class Team:
                                 callbacks=[on_event],
                                 **self.router.public_conversation_kwargs(
                                     self.role_for(role)))
-            self._charge()                       # one request charged up front
+            self._charge()                       # reserve 1 request before send
             conv.send_message(task.render())
             conv.run()
+            # One usage entry per completion: that is the real number of paid
+            # requests, which is what this plan bills (not tokens, not tasks).
             calls = len(getattr(llm.metrics, "token_usages", []) or []) or 1
+            self._settle(calls)
             self.router.record(self.role_for(role), calls)
             return AgentResult(id=task.id, role=role, ok=True, requests=calls,
                                actions=events, text="".join(texts),

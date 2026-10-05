@@ -382,26 +382,17 @@ class Router:
 
 # -------------------------------------------------------------- helpers
 def _record(model: str, source: str, calls: int = 1) -> None:
-    """Best-effort append to the owner's tokenwatch ledger; never fatal.
+    """Append to the owner's tokenwatch ledger via lib.ledger (the chokepoint).
 
-    Accounting must not be able to break a run, so failures are reported on
-    stderr and ignored. The console remains the source of truth for quota.
+    Kept as a thin wrapper so Router stays testable: tests set
+    ``MULTIAGENT_LEDGER=off`` and can then exercise ``tracked()`` / ``record()``
+    without writing fictional request counts into a real accounting file. That
+    pollution happened in this repo's first test pass and is the reason the
+    chokepoint exists.
     """
-    script = Path.home() / ".hermes" / "scripts" / "tokenwatch.py"
-    if calls <= 0 or not script.is_file():
-        return
-    try:
-        import importlib.util
+    from lib.ledger import record
 
-        spec = importlib.util.spec_from_file_location("tokenwatch", script)
-        if spec is None or spec.loader is None:
-            return
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        module.record(source, model, calls)
-    except Exception as exc:  # pragma: no cover
-        print(f"[router] tokenwatch record failed: {type(exc).__name__}",
-              file=sys.stderr)
+    record(model, calls, source)
 
 
 def _offset_for(tz_label: str) -> dt.timezone:

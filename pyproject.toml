@@ -30,6 +30,10 @@ dev = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+# tests/smoke_repo is a deliberately-broken fixture repo for the end-to-end
+# smoke test: its tests are SUPPOSED to fail until a fixer repairs them, so the
+# outer suite must not collect them (norecursedirs keeps `pytest tests/` green).
+norecursedirs = ["tests/smoke_repo", ".git", "__pycache__", "runs", "*.egg-info"]
 markers = [
     "live: touches a real paid endpoint (deselected unless LIVE=1)",
     "slow: multi-turn agent run, minutes not seconds",

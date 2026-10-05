@@ -67,25 +67,15 @@ def text_capture(name: str, text: str) -> Path:
 
 
 def record_calls(model: str, calls: int = 1, source: str = "multiagent-stack:repro") -> None:
-    """Log spent requests into the owner's tokenwatch ledger, if it exists.
+    """Log spent requests into the owner's tokenwatch ledger.
 
-    Quota on these plans is counted in REQUESTS, so the ledger is how we keep a
-    multi-agent run inside its budget (brief: target < 120 calls per team run).
+    Delegates to :func:`lib.ledger.record`, the single chokepoint: unit tests set
+    ``MULTIAGENT_LEDGER=off`` (see tests/conftest.py) so they can exercise
+    accounting code without writing fictional counts into a real budget file.
     """
-    if calls <= 0:
-        return
-    try:
-        import importlib.util
+    from lib.ledger import record
 
-        spec = importlib.util.spec_from_file_location("tokenwatch", TOKENWATCH)
-        if spec is None or spec.loader is None:
-            return
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        module.record(source, model, calls)
-    except Exception as exc:  # pragma: no cover - ledger is best-effort
-        print(f"[capture] tokenwatch record failed: {type(exc).__name__}: {exc}",
-              file=sys.stderr)
+    record(model, calls, source)
 
 
 def now_iso() -> str:
