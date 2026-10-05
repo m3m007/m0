@@ -318,3 +318,84 @@ def test_table_exposes_probe_provenance_for_auditing(router):
     assert {"probes", "trusted", "one_shot_outside_loop"} <= set(rows[0])
     states = {r["probes"]["raw_curl"] for r in rows}
     assert states <= {"verified_here", "verified_in_brief", "untested", "failed"}
+
+
+# -------------------------------------------------- thinking-consistency guard
+def _cfg_with_lane(lane_spec: dict) -> dict:
+    base = copy.deepcopy(Router.load().cfg)
+    # default probes to proven so these tests exercise the consistency guard,
+    # not the unrelated probe-trust gate (which has its own tests)
+    lane_spec = {'probes': {'raw_curl': 'verified_here', 'litellm': 'verified_here',
+                            'sdk_conversation': 'verified_here'}, **lane_spec}
+    base["lanes"]["probe_lane"] = lane_spec
+    base["roles"]["probe_lane"] = {"lane": "probe_lane"}
+    return base
+
+
+def test_enable_thinking_false_without_effort_override_is_refused():
+    """The exact contradiction that killed the first live smoke run (HTTP 400:
+    "'reasoning_effort' must be 'none' when 'enable_thinking' is false")."""
+    cfg = _cfg_with_lane({"model": "openai/qwen3.8-flash",
+                          "extra_body": {"enable_thinking": False}})
+    with pytest.raises(RouterError, match="enable_thinking=false"):
+        Router(cfg)
+
+
+def test_enable_thinking_false_with_effort_override_loads():
+    cfg = _cfg_with_lane({"model": "openai/qwen3.8-flash",
+                          "extra_body": {"enable_thinking": False},
+                          "capability_overrides": {"supports_reasoning_effort": False}})
+    lane = Router(cfg).lane_for("probe_lane")
+    assert lane.capability_overrides["supports_reasoning_effort"] is False
+
+
+def test_enable_thinking_true_needs_no_override():
+    cfg = _cfg_with_lane({"model": "openai/qwen3.8-max",
+                          "extra_body": {"enable_thinking": True}})
+    assert Router(cfg).lane_for("probe_lane").extra_body["enable_thinking"] is True
+
+
+def test_no_extra_body_is_not_flagged():
+    cfg = _cfg_with_lane({"model": "anthropic/glm-5.3"})
+    assert Router(cfg).lane_for("probe_lane")
+
+
+def test_shipped_config_is_self_consistent(router):
+    """Every lane in router.yaml that disables thinking must disable effort too."""
+    for lane_name in router.lanes:
+        lane = router._lanes[lane_name]
+        if lane.extra_body.get("enable_thinking") is False:
+            assert lane.capability_overrides.get(
+                "supports_reasoning_effort") is False, lane_name
+
+
+def test_capability_override_reaches_the_llm(router):
+    """The override is not decoration: it must suppress the parameter.
+
+    Cross-checked against the captured outbound request (repro/capture_request.py,
+    0 calls): with the override, reasoning_effort is absent from the body the SDK
+    actually sends. Without it the SDK injects reasoning_effort='high' for this
+    model -- precisely the mismatch the endpoint rejects.
+    """
+    from openhands.sdk.llm.utils.model_features import get_features
+
+    lane = router.lane_for("implementer")
+    assert lane.capability_overrides == {"supports_reasoning_effort": False}
+    kwargs = router.llm_kwargs("implementer")
+    assert kwargs["capability_overrides"] == {"supports_reasoning_effort": False}
+    assert get_features(lane.model, None, lane.capability_overrides
+                        ).supports_reasoning_effort is False
+    assert get_features(lane.model).supports_reasoning_effort is True
+
+
+def test_extra_body_still_travels_to_the_llm(router):
+    assert router.llm_kwargs("implementer")["litellm_extra_body"] == {
+        "enable_thinking": False}
+
+
+def test_unknown_capability_key_is_carried_not_fatal(router):
+    """The SDK ignores unknown override keys; a typo must not brick the config."""
+    cfg = _cfg_with_lane({"model": "anthropic/glm-5.3",
+                          "capability_overrides": {"supports_typo_here": True}})
+    assert Router(cfg).lane_for("probe_lane").capability_overrides
+

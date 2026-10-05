@@ -53,10 +53,37 @@ from router import Router, RouterError  # noqa: E402
 ROLES_DIR = HERE / "roles"
 
 #: The Task-Z self-wake line, appended verbatim to every task.
-TASK_Z_LINE = (
+#:
+#: The status FILE IS PER-TASK, not shared. A single DONE.md is a collision I
+#: actually hit in the first live smoke run: two parallel fixers both tried to
+#: write it, one found it occupied and had to append around the other. With
+#: per-task files, "is this task done?" is answerable without two agents racing
+#: on one inode, and a stale DONE.md from an earlier run cannot masquerade as
+#: this run's status.
+#:
+#: The sentence itself is identical for every task except the filename, so the
+#: shared prefix stays cache-stable (rule 1).
+TASK_Z_TEMPLATE = (
     "TASK-Z: if you get blocked, cannot proceed, or finish, still write your "
-    "status to DONE.md in this workspace and call finish anyway - the next "
-    "agent wakes on that file, not on you.")
+    "status to {status_file} in this workspace and call finish anyway - the "
+    "next agent wakes on that file, not on you.")
+DEFAULT_STATUS_FILE = "DONE.md"
+
+
+def task_z_line(status_file: str = DEFAULT_STATUS_FILE) -> str:
+    """The self-wake instruction, naming the file this task alone owns."""
+    return TASK_Z_TEMPLATE.format(status_file=status_file)
+
+
+#: Back-compatible name for the generic line (used in docs and older call sites).
+TASK_Z_LINE = task_z_line()
+
+
+def status_file_for(task_id: str) -> str:
+    """The per-task status filename an agent must write."""
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", task_id or "task")
+    return f"DONE-{safe}.md"
+
 
 #: Prompt fragments that make a cache hit impossible.
 UNSTABLE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
@@ -94,8 +121,14 @@ class Task:
         if self.acceptance:
             lines.append("Acceptance gates (each must exit 0):")
             lines.extend(f"  - {cmd}" for cmd in self.acceptance)
-        lines.append(TASK_Z_LINE)
+        lines.append(task_z_line(self.status_file))
         return "\n".join(lines)
+
+    @property
+    def status_file(self) -> str:
+        """The one status file this task owns. Per-task by construction, so
+        parallel agents never write to the same file."""
+        return status_file_for(self.id)
 
 
 @dataclass
@@ -202,6 +235,23 @@ class Team:
                                 f"configured ceiling of {configured}")
             return self.max_requests
         return configured
+
+    def clear_stale_status_files(self) -> list[str]:
+        """Remove DONE*.md from the workspace before a run.
+
+        The self-wake contract says the next agent reads a status file. If last
+        run's files survive, an agent wakes on a status that describes a world
+        that no longer exists -- a stale 'DONE' is worse than no signal, because
+        it looks like progress. Returns the names removed.
+        """
+        removed = []
+        for path in sorted(self.workspace.glob("DONE*.md")):
+            try:
+                path.unlink()
+                removed.append(path.name)
+            except OSError:
+                pass
+        return removed
 
     def _charge(self, n: int = 1) -> None:
         if self._requests + n > self.ceiling:
@@ -423,8 +473,10 @@ class Team:
         """
         brief_path = Path(brief_path)
         spec_path = self._spec_path(spec_file)
+        stale = self.clear_stale_status_files()
         report: dict[str, Any] = {"steps": [], "requests_charged": 0,
-                                  "spec_file": str(spec_path)}
+                                  "spec_file": str(spec_path),
+                                  "cleared_stale_status_files": stale}
         spec_result = self.run_task(Task(
             id="spec", role="architect",
             instruction=(
@@ -471,12 +523,16 @@ class Team:
 
         review = self.run_task(Task(
             id="review", role="reviewer",
-            instruction=("Verify each acceptance gate in this workspace by "
-                         "running it. Report PASS or FAIL per task with the "
-                         "command output that justifies it. Write the verdict "
-                         "to DONE.md."),
-            paths=("DONE.md",), acceptance=("python3 lib/secret_scan.py",)))
+            instruction=(
+                "Verify each acceptance gate in this workspace by running it. "
+                "Read every per-task status file matching DONE*.md, then report "
+                "PASS or FAIL per task with the command output that justifies "
+                "it. Write your verdict to DONE.md (you are the only agent "
+                "allowed to use that name). If a status file reports a gate it "
+                "could not run, say so rather than marking it passed."),
+            paths=("DONE.md",), acceptance=("python3 -m pytest -q",)))
         report["steps"].append(self._as_dict(review))
+        report["status_files"] = sorted(p.name for p in self.workspace.glob("DONE*.md"))
         report["requests_charged"] = self._requests
         if self.dry_run and self._seeded_spec:
             try:

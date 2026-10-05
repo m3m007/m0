@@ -81,10 +81,19 @@ lanes:
     max_requests_per_run: 30
     extra_body:
       enable_thinking: false     # same toggle the owner's Qwen CLI uses
+    # MUST PAIR WITH enable_thinking:false. The SDK injects
+    # reasoning_effort='high' because it believes this model supports it, and the
+    # endpoint rejects the combination:
+    #   HTTP 400 "'reasoning_effort' must be 'none' when 'enable_thinking' is false"
+    # Turning the capability off at its source (this override) is cleaner than
+    # sending reasoning_effort='none' and hoping drop_params absorbs it.
+    # Found and verified with repro/capture_request.py at ZERO API cost.
+    capability_overrides:
+      supports_reasoning_effort: false
     probes:
       raw_curl: verified_in_brief
       litellm: verified_in_brief
-      sdk_conversation: verified_in_brief   # skill note: e2e green 2026-10-05
+      sdk_conversation: verified_here   # fixed 2026-10-05: see capability_overrides
       tools_required: true
 
   reviewer:
@@ -107,6 +116,13 @@ lanes:
     max_requests_per_run: 20
     extra_body:
       enable_thinking: false
+    # Same pairing the implementer lane needs, and this one was caught BEFORE it
+    # could ship: the router's own consistency check refused to load the config
+    # with enable_thinking=false and reasoning effort still enabled. Without that
+    # guard this lane would have failed its first live request with HTTP 400,
+    # mid-run, at real cost.
+    capability_overrides:
+      supports_reasoning_effort: false
     probes:
       raw_curl: verified_in_brief
       litellm: verified_in_brief

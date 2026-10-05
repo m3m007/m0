@@ -217,6 +217,37 @@ class Router:
             raise RouterError("config defines no lanes")
         if not self._roles:
             raise RouterError("config defines no roles")
+        for lane in self._lanes.values():
+            self._check_thinking_consistency(lane)
+
+    @staticmethod
+    def _check_thinking_consistency(lane: Lane) -> None:
+        """Refuse a lane that asks for thinking OFF and effort ON.
+
+        Real incident: the flash lane set ``extra_body.enable_thinking=false``
+        (copied from the owner's Qwen CLI config) while the SDK still injected
+        ``reasoning_effort='high'`` for that model. The endpoint answered
+
+            HTTP 400 "'reasoning_effort' must be 'none' when
+                       'enable_thinking' is false"
+
+        and the whole live smoke run died. That is a config contradiction, not a
+        model limitation, and it is detectable before a single request: the same
+        check the endpoint makes, made here, for free.
+        """
+        thinking = lane.extra_body.get("enable_thinking")
+        if thinking is not False:
+            return
+        effort = lane.capability_overrides.get("supports_reasoning_effort")
+        if effort is not False:
+            raise RouterError(
+                f"lane {lane.name!r} sets extra_body.enable_thinking=false but "
+                f"does not disable reasoning effort (capability_overrides."
+                f"supports_reasoning_effort={effort!r}). The SDK will still "
+                f"inject reasoning_effort for {lane.model!r} and the endpoint "
+                "rejects the pair with HTTP 400. Set "
+                "capability_overrides: {supports_reasoning_effort: false} on "
+                "this lane, or drop enable_thinking.")
 
     # ------------------------------------------------------------ selection
     def lane_for(self, role: str, *, allow_untrusted: bool = False,
