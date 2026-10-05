@@ -154,18 +154,35 @@ def assert_disjoint(tasks: list[Task]) -> None:
 
 # ------------------------------------------------------------------ the team
 class Team:
-    """Role files + router lanes, ready to run in one workspace."""
+    """Role files + router lanes, ready to run in one workspace.
+
+    ``dry_run=True`` walks the entire workflow -- architect prompt, spec parsing,
+    overlap checks, reviewer step -- while sending nothing. It exists because the
+    cost of discovering a wiring mistake at runtime is measured in requests, and
+    on this plan requests are the thing we are trying to save.
+    """
+
+    #: What a dry run pretends the architect wrote, so the happy path is tested.
+    DRY_SPEC = json.dumps([
+        {"id": "T1", "role": "fixer", "instruction": "Implement the first fix.",
+         "paths": ["dry_a.py"], "acceptance": ["python3 -m py_compile dry_a.py"]},
+        {"id": "T2", "role": "fixer", "instruction": "Implement the second fix.",
+         "paths": ["dry_b.py"], "acceptance": ["python3 -m py_compile dry_b.py"]},
+    ], indent=2)
 
     def __init__(self, workspace: str | Path, *, router: Router | None = None,
                  roles_dir: str | Path | None = None,
-                 max_requests: int | None = None):
+                 max_requests: int | None = None, dry_run: bool = False):
         self.workspace = Path(workspace)
         if not self.workspace.is_dir():
             raise TeamError(f"workspace does not exist: {self.workspace}")
         self.router = router or Router.load()
         self.max_requests = max_requests
+        self.dry_run = dry_run
         self.results: list[AgentResult] = []
         self._requests = 0
+        self._spec_done = False
+        self._seeded_spec = False
         ensure_tools_registered()          # RC3: registry is empty until this
         try:
             defs = load_roles(roles_dir or ROLES_DIR)
@@ -268,9 +285,31 @@ class Team:
         return out
 
     # -- execution ------------------------------------------------------
+    def _spec_path(self, override: str | Path | None) -> Path:
+        return Path(override) if override else (self.workspace / "TEAM-SPEC.json")
+
     def run_task(self, task: Task) -> AgentResult:
         """Run one task through its role. This spends real requests."""
         role = task.role if task.role in self.defs else "fixer"
+        if self.dry_run:
+            # Still build the agent: that is where RC1/RC2/RC3 get caught. Only
+            # the conversation is skipped, so a dry run exercises every check
+            # that costs nothing and skips only the thing that costs money.
+            agent, _llm, lane = self.build_agent(role)
+            names = sorted({getattr(t, "name", str(t)) for t in agent.tools})
+            if task.id == "spec" and not self._spec_done:
+                # Seed the spec file so run_workflow exercises its real
+                # file-parsing path, then clear it: leaving TEAM-SPEC.json
+                # behind after a --dry-run would make the next "clean" checkout
+                # differ from this one, and a stale spec is a silent wrong plan.
+                self._spec_path(None).write_text(self.DRY_SPEC, encoding="utf-8")
+                self._spec_done = True
+                self._seeded_spec = True
+            return AgentResult(id=task.id, role=role, ok=True, requests=0,
+                               actions=["DRY-RUN"],
+                               text=self.DRY_SPEC if task.id == "spec" else "",
+                               summary=f"dry-run lane={lane.name} "
+                                       f"model={lane.model} tools={names}")
         events: list[str] = []
         texts: list[str] = []
         try:
@@ -313,7 +352,12 @@ class Team:
                                error=f"{type(exc).__name__}: {str(exc)[:200]}")
 
     def map_agents(self, tasks: list[Task]) -> list[AgentResult]:
-        """Run independent tasks concurrently; refuse if they are not disjoint.
+        """Run independent tasks concurrently, in dependency-ordered waves.
+
+        Tasks are grouped into waves by their ``depends_on`` ids; everything in
+        one wave runs in parallel, then the next wave starts. Without this, a
+        task that needs another's output could run first and "pass" against a
+        file that does not exist yet.
 
         Concurrency is capped by the lane's ``concurrency_limit``. The plan bills
         requests against a rolling window, so N agents firing simultaneously is
@@ -323,51 +367,89 @@ class Team:
         if not tasks:
             return []
         assert_disjoint(tasks)
-        lanes = [self.router.lane_for(self.role_for(t.role
-                     if t.role in self.defs else "fixer")) for t in tasks]
-        workers = min(len(tasks), max(l.concurrency_limit for l in lanes))
-        if workers <= 1:
-            results = [self.run_task(t) for t in tasks]
-        else:
-            with cf.ThreadPoolExecutor(max_workers=workers) as pool:
-                results = list(pool.map(self.run_task, tasks))
+        results: list[AgentResult] = []
+        for wave in order_waves(tasks):
+            lanes = [self.router.lane_for(self.role_for(t.role
+                         if t.role in self.defs else "fixer")) for t in wave]
+            workers = min(len(wave), max(l.concurrency_limit for l in lanes))
+            if workers <= 1:
+                wave_results = [self.run_task(t) for t in wave]
+            else:
+                with cf.ThreadPoolExecutor(max_workers=workers) as pool:
+                    wave_results = list(pool.map(self.run_task, wave))
+            failed = [r.id for r in wave_results if not r.ok]
+            if failed:
+                for r in wave_results:
+                    self.results.append(r)
+                raise TeamError(
+                    f"task(s) {failed} failed; refusing to run dependent waves. "
+                    "A dependent task built on a broken base reports success "
+                    "about a world that does not exist.")
+            results.extend(wave_results)
         self.results.extend(results)
         return results
 
     def run_workflow(self, brief_path: str | Path, *,
                      spec_parser: Callable[[str], list[Task]] | None = None,
+                     spec_file: str | Path | None = None,
                      ) -> dict[str, Any]:
         """architect spec -> parallel fixers -> reviewer, with accounting.
 
-        ``spec_parser`` turns the architect's free text into Tasks. It defaults
-        to :func:`parse_tasks`, which reads a fenced JSON block; pass something
-        stricter for production, because a loosely parsed spec is how two fixers
-        end up owning the same file.
+        The architect is asked to WRITE ITS SPEC TO A FILE, and we read that file
+        first. Parsing chat text is the fallback, not the primary path: an agent
+        can complete a run with no final text event at all (observed in this
+        repo's own probes), which would silently yield zero tasks. A file either
+        exists with valid JSON in it or it does not — there is no quiet middle.
+
+        ``spec_parser`` turns free text into Tasks when the file is absent; it
+        defaults to :func:`parse_tasks`, which reads a fenced JSON block. Pass
+        something stricter for production: a loosely parsed spec is how two
+        fixers end up owning the same file.
         """
-        report: dict[str, Any] = {"steps": [], "requests_charged": 0}
+        brief_path = Path(brief_path)
+        spec_path = self._spec_path(spec_file)
+        report: dict[str, Any] = {"steps": [], "requests_charged": 0,
+                                  "spec_file": str(spec_path)}
         spec_result = self.run_task(Task(
             id="spec", role="architect",
-            instruction=("Read the brief at " + str(brief_path) + ". Produce a "
-                         "numbered task spec. For each task give: id, role "
-                         "(fixer/tester/reviewer), one instruction, the exact "
-                         "file paths it may touch, and acceptance commands that "
-                         "must exit 0. Emit the tasks as a single fenced JSON "
-                         "array at the end of your reply. Do not edit any file."),
-            paths=(), acceptance=()))
+            instruction=(
+                "Read the brief at " + str(brief_path) + ". Produce a numbered "
+                "task spec for fixers and testers working in parallel in this "
+                "workspace. WRITE THE SPEC TO THE FILE " + str(spec_path) + " as "
+                "a JSON array of objects with keys: id, role, instruction, "
+                "paths (files that task alone may touch), acceptance (commands "
+                "that must exit 0). Paths must be DISJOINT across tasks or the "
+                "run will be refused. Then repeat the same array in a fenced "
+                "json block in your reply. Do not edit any other file."),
+            paths=(str(spec_path),), acceptance=()))
         report["steps"].append(self._as_dict(spec_result))
         if not spec_result.ok:
             report["aborted"] = "architect failed: " + str(spec_result.error)
             report["requests_charged"] = self._requests
             return report
 
-        tasks = (spec_parser or parse_tasks)(spec_result.text)
+        tasks: list[Task] = []
+        source = None
+        if spec_path.is_file():
+            try:
+                tasks = parse_spec_json(spec_path.read_text(encoding="utf-8"))
+                if tasks:
+                    source = "file"
+            except Exception as exc:
+                report["warnings"] = (report.get("warnings") or []) + [
+                    f"spec file present but unparseable: {type(exc).__name__}"]
+        if not tasks:
+            tasks = (spec_parser or parse_tasks)(spec_result.text)
+            if tasks:
+                source = "reply"
+        report["spec_source"] = source
         report["tasks_parsed"] = len(tasks)
         if not tasks:
-            # Loud, not silent: an architect that returns prose with no task
-            # block is a failed step, and skipping fixers quietly would let the
-            # run report success having built nothing.
+            # Loud, never silent: an architect that produced no task list is a
+            # failed step, and skipping fixers quietly would let the run report
+            # success having built nothing.
             report["warnings"] = (report.get("warnings") or []) + [
-                "architect returned no parseable task block; fixers were skipped"]
+                "architect produced no parseable task spec; fixers were skipped"]
         else:
             report["steps"].extend(self._as_dict(r)
                                    for r in self.map_agents(tasks))
@@ -381,6 +463,12 @@ class Team:
             paths=("DONE.md",), acceptance=("python3 lib/secret_scan.py",)))
         report["steps"].append(self._as_dict(review))
         report["requests_charged"] = self._requests
+        if self.dry_run and self._seeded_spec:
+            try:
+                self._spec_path(None).unlink()
+                report["spec_file"] = str(self._spec_path(None)) + " (seeded then removed)"
+            except OSError:
+                pass
         return report
 
     @staticmethod
@@ -395,16 +483,82 @@ class Team:
 
 
 # ------------------------------------------------------------- spec parsing
+def order_waves(tasks: list[Task]) -> list[list[Task]]:
+    """Group tasks into dependency-ordered waves; wave N runs after wave N-1.
+
+    Raises on an unknown dependency or a cycle. Refusing is deliberate: an
+    unresolvable spec silently reorders into "everything at once", which means a
+    fixer builds on a file that another fixer has not written yet.
+    """
+    by_id = {t.id: t for t in tasks}
+    if len(by_id) != len(tasks):
+        raise TeamError("duplicate task ids in spec; parallel agents would "
+                        "collide on the same identity")
+    remaining = dict(by_id)
+    done: set[str] = set()
+    waves: list[list[Task]] = []
+    while remaining:
+        ready = [t for t in remaining.values()
+                 if all(dep in done for dep in t.depends_on)]
+        if not ready:
+            unresolved = {t.id: [d for d in t.depends_on if d not in by_id]
+                          for t in remaining.values()}
+            unknown = {k: v for k, v in unresolved.items() if v}
+            if unknown:
+                raise TeamError(f"tasks depend on unknown ids: {unknown}")
+            raise TeamError(f"dependency cycle among {sorted(remaining)}")
+        for t in ready:
+            remaining.pop(t.id)
+            done.add(t.id)
+        waves.append(ready)
+    return waves
+
+
 #: Acceptance commands are REPORTED, never executed by this module. They come
 #: from model output, and shelling out to model-authored strings is how a
 #: "review" step becomes an arbitrary-code-execution step. A human or the
 #: reviewer agent runs them; the orchestrator only records them.
+def _rows_to_tasks(data: Any) -> list[Task]:
+    """Coerce parsed JSON into Tasks. Returns [] rather than a partial spec."""
+    if isinstance(data, dict):
+        data = data.get("tasks") or []
+    if not isinstance(data, list):
+        return []
+    tasks: list[Task] = []
+    for i, item in enumerate(data):
+        if not isinstance(item, dict) or "instruction" not in item:
+            continue
+        tasks.append(Task(
+            id=str(item.get("id") or f"T{i + 1}"),
+            role=str(item.get("role") or "fixer"),
+            instruction=str(item["instruction"]),
+            paths=tuple(str(p) for p in (item.get("paths") or ())),
+            acceptance=tuple(str(a) for a in (item.get("acceptance") or ())),
+            depends_on=tuple(str(d) for d in (item.get("depends_on") or ()))))
+    return tasks
+
+
+def parse_spec_json(text: str) -> list[Task]:
+    """Parse the architect's spec FILE: strict JSON first, fenced-block second.
+
+    Returns [] on anything unrecognised. A half-read spec is worse than none,
+    because it silently drops work the reviewer will then grade as missing.
+    """
+    if not text or not text.strip():
+        return []
+    try:
+        return _rows_to_tasks(json.loads(text))
+    except json.JSONDecodeError:
+        pass
+    return parse_tasks(text)          # tolerate a fenced block inside the file
+
+
 def parse_tasks(text: str) -> list[Task]:
     """Extract a JSON task array from an architect's reply.
 
     Tolerates prose around the block and a top-level {"tasks": [...]} wrapper,
     because models do both. Anything unparseable returns [] rather than a
-    half-read spec — a silently wrong task list is worse than no task list.
+    half-read spec.
     """
     if not text:
         return []
@@ -412,24 +566,9 @@ def parse_tasks(text: str) -> list[Task]:
     candidates += re.findall(r"(\[\s*\{.*\}\s*\])", text, re.S)
     for blob in candidates:
         try:
-            data = json.loads(blob)
+            tasks = _rows_to_tasks(json.loads(blob))
         except json.JSONDecodeError:
             continue
-        if isinstance(data, dict):
-            data = data.get("tasks") or []
-        if not isinstance(data, list):
-            continue
-        tasks: list[Task] = []
-        for i, item in enumerate(data):
-            if not isinstance(item, dict) or "instruction" not in item:
-                continue
-            tasks.append(Task(
-                id=str(item.get("id") or f"T{i + 1}"),
-                role=str(item.get("role") or "fixer"),
-                instruction=str(item["instruction"]),
-                paths=tuple(str(p) for p in (item.get("paths") or ())),
-                acceptance=tuple(str(a) for a in (item.get("acceptance") or ())),
-                depends_on=tuple(str(d) for d in (item.get("depends_on") or ()))))
         if tasks:
             return tasks
     return []
@@ -464,6 +603,9 @@ why --plan exists
                     help="repo the team works in (default: this repo)")
     ap.add_argument("--plan", action="store_true",
                     help="validate and print the plan; spends 0 requests")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="walk the whole workflow (architect, spec parse, "
+                         "overlap check, reviewer) but send 0 requests")
     ap.add_argument("--lanes", action="store_true",
                     help="print the router lane table; spends 0 requests")
     ap.add_argument("--max-requests", type=int, default=None,
@@ -487,10 +629,28 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         team = Team(args.workspace, router=router, roles_dir=args.roles_dir,
-                    max_requests=args.max_requests)
+                    max_requests=args.max_requests, dry_run=args.dry_run)
     except TeamError as exc:
         print(f"REFUSED BEFORE SPEND: {exc}", file=sys.stderr)
         return 2
+
+    if args.dry_run:
+        if not args.brief:
+            print("REFUSED: --dry-run needs --brief PATH", file=sys.stderr)
+            return 2
+        report = team.run_workflow(args.brief)
+        print(json.dumps(report, indent=2, default=str))
+        spent = report["requests_charged"]
+        print(f"\nDRY RUN: steps={len(report['steps'])} "
+              f"tasks_parsed={report.get('tasks_parsed')} "
+              f"spec_source={report.get('spec_source')} requests={spent}")
+        if report.get("warnings"):
+            for w in report["warnings"]:
+                print("WARNING: " + w)
+        if spent != 0:
+            print("BUG: a dry run spent requests", file=sys.stderr)
+            return 1
+        return 1 if report.get("aborted") or report.get("warnings") else 0
 
     if args.plan:
         if not args.brief:
