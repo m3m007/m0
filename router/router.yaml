@@ -1,0 +1,162 @@
+# router.yaml — role -> (model, endpoint, params). Read by router/router.py only.
+# Secrets: no key values here. lib/keys.py resolves them from env/config at runtime.
+#
+# PROVENANCE of `probes:` — the difference matters, so it is explicit:
+#   verified_here       we ran it in this repo today and captured the output
+#   verified_in_brief   the owner's live probes (brief, 2026-10-05) assert it
+#   untested            nobody has checked: do not wire it into a run blind
+# Only glm-5.3 is verified_here in this repo. Claiming more is how a stack ends
+# up trusting a lane nobody actually probed.
+#
+# Ground truth encoded:
+#   * One Token Plan key serves two endpoints. Pair openai/ <-> compatible-mode,
+#     or anthropic/ <-> apps/anthropic. Mismatched pairs return an opaque HTTP
+#     400, so validate_lane() rejects them at config-parse time.
+#   * Quota is billed in REQUESTS, not tokens. Budgets below are request budgets.
+#     litellm has no price map for these ids ("This model isn't mapped yet"), so
+#     the SDK's USD budget guard never trips here — count requests instead.
+#   * Prompt-cache hits (observed 91-99%) are what keep those requests cheap.
+
+version: 1
+
+defaults:
+  temperature: 0.0
+  streaming: false
+  drop_params: true
+  retry_max_attempts: 3
+  retry_multiplier: 2.0
+  retry_min_wait: 2
+  retry_max_wait: 30
+  max_iterations: 25
+  max_requests_per_run: 40
+  concurrency_limit: 2
+
+budget:
+  caps_requests:            # plan windows, requests (mirrors tokenwatch.py caps)
+    rolling_5h: 6000
+    week: 45000
+    month: 90000
+  # Brief target: architect -> 2 fixers -> reviewer stays under 120 requests.
+  # We hold 100 to leave headroom for retries and re-delegated fixes.
+  max_requests_per_team_run: 100
+  night_window:             # 22:00-08:00 UTC+8 is discounted: a hint, never a block
+    tz: "UTC+8"
+    start_hour: 22
+    end_hour: 8
+    prefer: true
+
+lanes:
+  architect:
+    model: "anthropic/glm-5.3"
+    purpose: "spec authoring, adversarial review, root-cause analysis"
+    temperature: 0.2
+    max_iterations: 30
+    max_requests_per_run: 35
+    # thinking stays off: the SDK emits no thinking kwargs unless thinking_mode
+    # is manual/adaptive, and tool calling works without it (FINDINGS.md H1).
+    capability_overrides: {}
+    one_shot_outside_loop: false
+    probes:
+      raw_curl: verified_here
+      litellm: verified_here
+      sdk_conversation: verified_here   # full task completed, 93% cache hit
+      tools_required: true
+
+  fallback_architect:
+    model: "anthropic/deepseek-v4-pro"
+    purpose: "architect backup if glm-5.3 degrades"
+    temperature: 0.2
+    max_iterations: 30
+    max_requests_per_run: 35
+    probes:
+      raw_curl: verified_in_brief
+      litellm: verified_in_brief
+      sdk_conversation: untested
+      tools_required: true
+
+  implementer:
+    model: "openai/qwen3.8-flash"
+    purpose: "edits, refactors, mechanical fixes"
+    max_iterations: 40
+    max_requests_per_run: 30
+    extra_body:
+      enable_thinking: false     # same toggle the owner's Qwen CLI uses
+    probes:
+      raw_curl: verified_in_brief
+      litellm: verified_in_brief
+      sdk_conversation: verified_in_brief   # skill note: e2e green 2026-10-05
+      tools_required: true
+
+  reviewer:
+    model: "openai/qwen3.8-max"
+    purpose: "PASS/FAIL against acceptance gates"
+    max_iterations: 12
+    max_requests_per_run: 15
+    extra_body:
+      enable_thinking: true
+    probes:
+      raw_curl: verified_in_brief
+      litellm: verified_in_brief
+      sdk_conversation: untested
+      tools_required: false
+
+  tester:
+    model: "openai/qwen3.8-flash"
+    purpose: "pytest / build / lint loops"
+    max_iterations: 20
+    max_requests_per_run: 20
+    extra_body:
+      enable_thinking: false
+    probes:
+      raw_curl: verified_in_brief
+      litellm: verified_in_brief
+      sdk_conversation: verified_in_brief
+      tools_required: true
+
+  kimi_backup:
+    model: "openai/kimi-for-coding"
+    transport: kimi
+    purpose: "emergency only; backup lane until ~2026-10-10"
+    max_iterations: 20
+    max_requests_per_run: 20
+    expires: "2026-10-10"
+    degraded: true               # time-limited subscription, not a proven defect
+    probes:
+      raw_curl: untested
+      litellm: verified_in_brief
+      sdk_conversation: verified_in_brief
+      tools_required: true
+
+roles:
+  # A role is what the team asks for; a lane is what gets built. Separating them
+  # lets us re-point a role without touching code.
+  architect:    { lane: architect,        tools: [terminal, file_editor], parallel: false }
+  research:     { lane: architect,        tools: [terminal, file_editor], parallel: false }
+  fixer:        { lane: implementer,      tools: [terminal, file_editor, task_tracker], parallel: true }
+  implementer:  { lane: implementer,      tools: [terminal, file_editor, task_tracker], parallel: true }
+  reviewer:     { lane: reviewer,         tools: [terminal, file_editor], parallel: false }
+  tester:       { lane: tester,           tools: [terminal, file_editor], parallel: true }
+  orchestrator: { lane: implementer,      tools: [terminal, file_editor, task_tracker, task], parallel: false }
+
+# ---------------------------------------------------------------------------
+# PREFIX-CACHE RULES — what keeps request counts affordable. Ordered by damage.
+#   1. STABLE SYSTEM PROMPT, BYTE-FOR-BYTE. One changed character in the prefix
+#      invalidates the cached prefix for every later turn. No timestamps, no run
+#      ids, no "today's date", no f-strings inside prompts.
+#   2. APPEND-ONLY HISTORY. Never rewrite, reorder, or re-render past messages;
+#      editing an earlier message re-keys everything after it.
+#   3. FROZEN TOOL LIST. The tool array is part of the cached prefix: same set,
+#      same order, same schemas for the whole conversation. Need a new tool?
+#      Start a new conversation.
+#   4. COMPACT ONLY AT 60-70%. Earlier throws away cache you are still paying
+#      for; later risks overflow. router.py refuses a band outside 0-1.
+#   5. STABLE prompt_cache_key per lane so parallel agents share one prefix
+#      instead of thrashing separate shards. LocalConversation only — the public
+#      Conversation factory does not accept it.
+# ---------------------------------------------------------------------------
+prefix_cache:
+  stable_system_prompt: true
+  append_only_history: true
+  frozen_tool_list: true
+  compact_band: [0.60, 0.70]
+  per_lane_cache_key: true
