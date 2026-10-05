@@ -382,7 +382,20 @@ class Team:
             def on_event(event) -> None:
                 name = type(event).__name__
                 if name == "ActionEvent":
-                    events.append(type(getattr(event, "action", None)).__name__)
+                    action = getattr(event, "action", None)
+                    events.append(type(action).__name__)
+                    # FinishAction carries the reply in .message. An acting turn
+                    # does not also emit a MessageEvent with source=agent, so
+                    # without this the agent's final text is invisible. A live
+                    # run showed the symptom: the architect spent 6 requests and
+                    # produced a FileEditorAction, yet the report recorded
+                    # text_len=0: the reply-fallback had nothing to read, so a
+                    # 6-request architect step contributed nothing to the run.
+                    # run_workflow did warn and skip fixers rather than claim
+                    # success, but the reply itself was still unrecoverable.
+                    message = getattr(action, "message", None)
+                    if isinstance(message, str) and message.strip():
+                        texts.append(message)
                 elif name == "MessageEvent":
                     if getattr(event, "source", "") != "agent":
                         return
