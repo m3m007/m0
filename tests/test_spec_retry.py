@@ -203,6 +203,8 @@ def test_a_reply_on_the_retry_is_enough(monkeypatch, tmp_path):
     assert report["spec_attempts"] == 2
     assert report["spec_source"] == "reply"
     assert report["tasks_parsed"] == 2
+    assert report["spec_validation"] == {"file_exists": False, "file_tasks": 0,
+                                        "file_reason": "missing", "reply_tasks": 2}
 
 
 def test_both_attempts_empty_warns_and_still_runs_the_reviewer(monkeypatch,
@@ -222,10 +224,12 @@ def test_both_attempts_empty_warns_and_still_runs_the_reviewer(monkeypatch,
 
 
 def test_retry_requests_are_the_ones_actually_charged(monkeypatch, tmp_path):
-    """Accounting comes from _requests, not from whatever the stub claims.
+    """spec_requests_spent is read off the team's books, not the stub's claim.
 
-    Each attempt really settles 3 completions; ``spec_requests_spent`` must show
-    the team's own books, and the whole run's total must match them.
+    The fake attempt settles 3 real completions while reserving 1, so the team's
+    own counter is what the report must show: 3 per attempt, and the run total
+    equals 3 + 3 for the two spec attempts plus one request each for the two
+    fixers and the reviewer.
     """
     team, calls = scripted_team(tmp_path, monkeypatch,
                                 [spec_step(text="ok", completions=3),
@@ -234,8 +238,6 @@ def test_retry_requests_are_the_ones_actually_charged(monkeypatch, tmp_path):
     assert report["spec_attempts"] == 2
     assert report["spec_requests_spent"] == [3, 3]
     assert report["requests_charged"] == team._requests
-    # 3 completions per spec attempt (settled, not asserted by the stub), then
-    # one charged request per fixer and for the reviewer.
     assert report["requests_charged"] == 3 + 3 + 1 + 1 + 1
     assert calls == ["spec", "spec", "T1", "T2", "review"]
 
@@ -258,6 +260,23 @@ def test_both_spec_attempts_are_kept_in_the_step_list(monkeypatch, tmp_path):
     assert len(spec_steps) == 2, "each attempt is its own step, for the audit"
     assert report["spec_attempts"] == 2
     assert report["spec_validation"]["reply_tasks"] == 0, "last attempt is reported"
+
+
+def test_a_failed_architect_still_reports_the_validation(monkeypatch, tmp_path):
+    """spec_validation is recorded even when the step itself errors out."""
+    team, calls = scripted_team(tmp_path, monkeypatch,
+                                [lambda tm, task: AgentResult(
+                                    id=task.id, role=task.role, ok=False,
+                                    requests=1, error="boom")])
+    report = team.run_workflow(tmp_path / "BRIEF.md")
+    assert "boom" in report["aborted"], "the abort path is unchanged"
+    assert calls == ["spec"], "a failed architect runs nothing else"
+    assert report["spec_attempts"] == 1
+    assert set(report["spec_validation"]) == {"file_exists", "file_tasks",
+                                              "file_reason", "reply_tasks"}
+    assert report["spec_validation"]["file_exists"] is False
+    assert report["spec_requests_spent"] == [1]
+    assert report["requests_charged"] == 1 == team._requests
 
 
 # --------------------------------------------------------- stale spec files
@@ -402,7 +421,8 @@ def test_the_guard_refuses_a_non_system_python(monkeypatch, tmp_path):
     assert str(fake) in message
     assert ("SMOKE_LIVE=1 /usr/bin/python3 -m pytest tests/test_e2e_smoke.py -q -s"
             in message), message
-    assert "\n" not in message.strip(), "one line: a wrong interpreter is no stack trace"
+    assert "\n" not in message.strip(), \
+        "one line: a wrong interpreter is no stack trace"
 
 
 def test_the_guard_honours_the_interpreter_override(monkeypatch, tmp_path):

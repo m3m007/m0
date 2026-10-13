@@ -2,8 +2,10 @@
 
 Two modes, and the default one costs nothing:
 
-    /usr/bin/python3 -m pytest tests/test_e2e_smoke.py -q          # offline: 0 requests
-    SMOKE_LIVE=1 /usr/bin/python3 -m pytest tests/test_e2e_smoke.py -q -s   # real run, ~15-30
+    # offline, 0 requests:
+    /usr/bin/python3 -m pytest tests/test_e2e_smoke.py -q
+    # the real run, ~15-30 requests (this is the only working live command):
+    SMOKE_LIVE=1 /usr/bin/python3 -m pytest tests/test_e2e_smoke.py -q -s
 
 The interpreter is part of the command, not a detail. Observed live: the same
 run started with the oh-venv python died instantly with "No module named
