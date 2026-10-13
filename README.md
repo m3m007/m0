@@ -5,7 +5,15 @@ already pays for — Alibaba **Token Plan** as the main lane, **Kimi/Moonshot** 
 short-lived backup — without burning money, without leaking keys, and without
 pretending a model failed when our own wiring did.
 
-Everything here is local. `git init`, no GitHub push, no new paid service.
+**Plain-language summary, no jargon:** AI coding agents claim success far too
+often. This repo makes their work provable instead: every task carries a check
+command whose exit code decides pass or fail; every paid run has a hard call
+budget that refuses before spending; results are compared against the previous
+version of the code so "tests pass" only counts when the new work actually beats
+the old; and a run that touched nothing is reported separately from a run that
+tried and failed, because those need different fixes. It is one person's research
+code built *on top of* separate open-source projects (OpenHands SDK, Hermes), not
+a fork of them — improvements meant for those projects go to them as pull requests.
 
 ---
 
