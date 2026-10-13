@@ -524,8 +524,11 @@ def test_subdir_workspace_outcome_follows_the_repo(repo, tmp_path, monkeypatch):
 
 def test_refused_paths_write_no_record_but_carry_outcome(tmp_path, monkeypatch,
                                                         env):
+    """BUDGET_REFUSED stays side-effect free (R1 contract) yet still labels
+    itself `refused`, so a chokepoint can never be counted as a stall."""
     calls: list = []
     install_oh_stubs(monkeypatch, calls)
     res = tk.run_team(workspace=str(tmp_path / "nowhere"), budget_calls=999)
     assert res["outcome"] == "refused" and res["run_dir"] is None
-    assert not (env / "nowhere").exists() if env.exists() else True
+    assert calls == []
+    assert not env.exists() or list(env.iterdir()) == [], "no record, no lock"
