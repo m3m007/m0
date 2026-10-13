@@ -244,3 +244,4 @@ def test_keys_demo_runs_without_printing_the_key():
                         capture_output=True, text=True, check=False)
     assert rc.returncode == 0, rc.stdout + rc.stderr
     assert keys.token_plan_key() not in rc.stdout, "demo printed the real key"
+

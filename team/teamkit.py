@@ -20,6 +20,11 @@ Three runner disciplines (R1, ported from Gen-Verse/RSI-Anything hygiene ideas):
                 GATE_FAIL, and retained.json says what was kept.
   D3 Chokepoint budget_calls > 120 -> BUDGET_REFUSED with zero side effects;
                 TEAMKIT_DRY_RUN=1 -> DRY_PLAN, record + stdout plan, zero API calls.
+  D4 Outcome    every record carries `outcome`: success | partial_work |
+                abstained | refused | tie_kept. It separates "the system failed"
+                (gate failed after real edits) from "the system did nothing"
+                (N minutes, zero commits, zero tracked diff) so lane stalls are
+                not counted as gate failures. See README.
 Stdlib only, and openhands stays a lazy import so unit tests run on bare python3.
 """
 import hashlib, json, os, re, shutil, subprocess, sys, tempfile, time
@@ -127,13 +132,20 @@ STAGES = ('preflight', 'team_run', 'gate', 'lessons')
 
 
 class _Ctx:
-    """Per-run recording context: lock + recorder + stage ledger + baseline ref."""
+    """Per-run recording context: lock + recorder + stage ledger + baseline ref.
+
+    `baseline` (D4) is the read-only run-start fingerprint used to tell a failed
+    gate from a run that touched nothing; `baseline_ref` (D2) is the stash/HEAD
+    commit the pair check materializes. They are deliberately separate: the
+    fingerprint must exist for EVERY run, including single-gate ones.
+    """
 
     def __init__(self):
         self.recorder = None
         self.lock_path = None
         self.run_dir = None
         self.baseline_ref = None
+        self.baseline = None
         self.pair = None
         self.stages = {s: {'status': 'pending', 'attempts': 0} for s in STAGES}
 
@@ -157,7 +169,8 @@ def _rec():
 
 def _reset_rec(rec):
     """Clear a context so a finished (or refused) run leaves no stale state."""
-    rec.recorder = rec.lock_path = rec.run_dir = rec.baseline_ref = rec.pair = None
+    rec.recorder = rec.lock_path = rec.run_dir = rec.baseline_ref = None
+    rec.baseline = rec.pair = None
     rec.stages = {s: {'status': 'pending', 'attempts': 0} for s in STAGES}
 
 
@@ -341,11 +354,12 @@ def write_record(rec, result):
 # ------------------------------------------------------------- D3: chokepoint
 def _refused(budget_calls):
     """Existing return shape, emptied. Zero side effects: no preflight, no
-    network, no run dir, no lock."""
+    network, no run dir, no lock. `outcome` = refused: a chokepoint is not a
+    failed gate, so it must never land in failure stats."""
     return {"status": "BUDGET_REFUSED",
             "gate": None, "gate_tail": "", "lessons": None,
             "workdir_diff": "", "recent_commits": "", "orchestrator_final": "",
-            "run_dir": None, "pair": None,
+            "run_dir": None, "pair": None, "outcome": "refused",
             "reason": f"budget_calls={budget_calls} > {BUDGET_MAX_CALLS}; refusing before preflight"}
 
 
@@ -556,6 +570,132 @@ def evaluate_gate(rec, contract, workspace):
     return status, accepted, (r_new['tail'] + '\n' + r_base['tail'])[-800:], pair
 
 
+# ---------------------------------------------------------- D4: outcome split
+# "Did the system fail" and "did the system do nothing" are different diseases:
+# a failed gate needs a better brief, a zero-work stall needs a lane fix.
+OUTCOMES = ('success', 'partial_work', 'abstained', 'refused', 'tie_kept')
+_OUTCOME_SUCCESS = ('GATE_PASS', 'GATE_PASS_NEW')
+_OUTCOME_WORKED = ('GATE_FAIL', 'RUN_DONE_NO_GATE', 'ERROR')
+_OUTCOME_REFUSED = ('BUDGET_REFUSED', 'DRY_PLAN')
+
+
+def capture_workspace_state(workspace):
+    """READ-ONLY run-start (and run-finish) fingerprint of a workspace.
+
+    Keys: root (git toplevel, or None when not a work tree), ws (the path it was
+    captured from), head (HEAD sha, or '' for an unborn repo), tracked (the full
+    `git diff HEAD` text), porcelain (the full `git status --porcelain -uall`
+    text) and sha256 digests of both.
+
+    Reuses the `git status --porcelain` capture pattern from
+    capture_baseline_ref(), but never runs `git stash create` — it leaves no
+    dangling object in the user's repo — so it is cheap and safe on EVERY path,
+    including runs with no incumbent_gate. Both digests are repo-wide, because
+    that is what the team can reach: a sub-agent holds a shell, so scoping the
+    diff to the workspace subdirectory would credit the run with edits it never
+    made (or hide edits it made next door).
+    """
+    root, _rel = git_workspace(workspace)
+    if not root:
+        return {'root': None, 'ws': str(workspace), 'head': '', 'tracked': '',
+                'porcelain': '', 'tracked_sha': '', 'porcelain_sha': ''}
+    porcelain = _git_out(['git', '-C', str(root), 'status', '--porcelain', '-uall'])
+    tracked = _git_out(['git', '-C', str(root), 'diff', '--no-color', 'HEAD'])
+    return {'root': root, 'ws': str(workspace),
+            'head': _git_out(['git', '-C', str(root), 'rev-parse', 'HEAD']),
+            'tracked': tracked, 'tracked_sha': sha256_text(tracked),
+            'porcelain': porcelain, 'porcelain_sha': sha256_text(porcelain)}
+
+
+def work_evidence(base, after=None):
+    """What the run actually produced, between two fingerprints.
+
+    {'commits': int|None, 'tracked_changed': bool, 'new_dirt': [porcelain lines],
+     'measurable': bool}. commits is None (and measurable False) when the
+    workspace is not a git tree or had no HEAD at run start: 'we cannot see'
+    must never be reported as 'the team did nothing'.
+    """
+    base = base or {}
+    after = after if after is not None else capture_workspace_state(
+        base.get('root') or '.')
+    commits = _commits_since(base, after)
+    known = set((base.get('porcelain') or '').splitlines())
+    new_dirt = [l for l in (after.get('porcelain') or '').splitlines()
+                if l and l not in known]
+    return {'commits': commits,
+            'tracked_changed': (base.get('tracked_sha') or '') !=
+                               (after.get('tracked_sha') or ''),
+            'new_dirt': new_dirt,
+            'measurable': commits is not None}
+
+
+def _commits_since(base, after):
+    """`git rev-list --count <base head>..<after head>`; 0 when HEAD is the same;
+    None when either side is unknown (no git tree, unborn repo)."""
+    b, a = (base or {}).get('head') or '', (after or {}).get('head') or ''
+    if not b or not a:
+        return None
+    if b == a:
+        return 0
+    root = (after or {}).get('root') or (base or {}).get('root')
+    n = _git_out(['git', '-C', str(root), 'rev-list', '--count',
+                  '%s..%s' % (b, a)])
+    try:
+        return int(n)
+    except (TypeError, ValueError):
+        return None
+
+
+def produce_work(base, after=None):
+    """True when the run left evidence: new commits, a changed tracked diff, or
+    dirt that was not present at run start."""
+    ev = work_evidence(base, after)
+    if not ev['measurable']:
+        return True            # cannot prove zero work -> never claim abstention
+    return (ev['commits'] > 0 or ev['tracked_changed'] or bool(ev['new_dirt']))
+
+
+def classify_outcome(status, base=None, after=None):
+    """One of OUTCOMES for a finished (or refused, or crashed) run.
+
+    base/after are capture_workspace_state() dicts; `after` defaults to a fresh
+    capture of base's root, so a caller that has the run-start fingerprint only
+    needs the status. GATE_PASS / GATE_PASS_NEW -> success; GATE_PASS_TIE ->
+    tie_kept (retained, not proven better); BUDGET_REFUSED / DRY_PLAN ->
+    refused (zero spend, kept out of failure stats); GATE_FAIL /
+    RUN_DONE_NO_GATE / ERROR -> partial_work when there is work evidence,
+    abstained when the run touched nothing. Never raises.
+    """
+    try:
+        if status in _OUTCOME_SUCCESS:
+            return 'success'
+        if status == 'GATE_PASS_TIE':
+            return 'tie_kept'
+        if status in _OUTCOME_REFUSED:
+            return 'refused'
+        if status in _OUTCOME_WORKED:
+            return 'partial_work' if produce_work(base, after) else 'abstained'
+        return 'partial_work'
+    except Exception:
+        return 'partial_work'
+
+
+def _spend_started(rec):
+    """Did this run reach the point where conv.run() could spend? (D4: an ERROR
+    raised before that is a refusal — zero spend — not a failure of the team.)"""
+    try:
+        return int(rec.stages.get('team_run', {}).get('attempts', 0)) > 0
+    except Exception:
+        return True
+
+
+def _outcome_for(rec, status):
+    """classify_outcome() wired to this thread's run-start fingerprint."""
+    if status == 'ERROR' and not _spend_started(rec):
+        return 'refused'
+    return classify_outcome(status, getattr(rec, 'baseline', None))
+
+
 def _emit_plan(run_dir, plan):
     print('TEAMKIT DRY_PLAN')
     for k, v in plan.items():
@@ -608,6 +748,7 @@ def run_team(brief=None, spec=None, workspace='.', budget_calls=80, contract=Non
         return {"status": "DRY_PLAN", "gate": None, "gate_tail": "",
                 "lessons": None, "workdir_diff": "", "recent_commits": "",
                 "orchestrator_final": "", "run_dir": run_dir, "pair": None,
+                "outcome": "refused",
                 "plan": {"workspace": _ws, "model": _m, "base_url": _u,
                          "budget_calls": _b, "roles": roles,
                          "stages": list(STAGES),
@@ -616,6 +757,14 @@ def run_team(brief=None, spec=None, workspace='.', budget_calls=80, contract=Non
 
     # ---- D1: one lock per run slug, taken BEFORE any API call can be spent.
     rec = start_recording(os.path.abspath(workspace or '.'))
+    # ---- D4: read-only run-start fingerprint, captured on EVERY path (with or
+    # without incumbent_gate) before the team touches anything. It is what makes
+    # "no new commits AND no diff change" measurable without crediting the run
+    # for dirt the owner already had: digests are compared, not presence.
+    try:
+        rec.baseline = capture_workspace_state(os.path.abspath(workspace or '.'))
+    except Exception:
+        rec.baseline = None
     # ---- D2: baseline captured at run start, before the team touches anything.
     # Only when v2 is in play: `stash create` writes a dangling commit object
     # into the user's repo, and a legacy single-gate run has no use for it.
@@ -635,16 +784,24 @@ def run_team(brief=None, spec=None, workspace='.', budget_calls=80, contract=Non
                                  contract, model, base_url, roles, lessons,
                                  waive_lessons, max_empty_responses, on_run=on_run)
         rec.pair = result.get('pair')
+        # D4: outcome computed AFTER gating, from the run-start fingerprint vs
+        # the git state now. Existing keys keep their meaning; only outcome and
+        # work_evidence are added.
+        result['outcome'] = _outcome_for(rec, result.get('status'))
+        result['work_evidence'] = work_evidence(rec.baseline)
         # existing keys stay byte-compatible; ONLY run_dir is added (None if the
         # recording itself failed)
         result['run_dir'] = write_record(rec, result)
         return result
     except Exception as exc:
-        write_record(rec, {"status": "ERROR",
+        status = 'ERROR'
+        write_record(rec, {"status": status,
                            "error": f'{type(exc).__name__}: {str(exc)[-300:]}',
                            "gate": None, "gate_tail": "", "lessons": None,
                            "workdir_diff": "", "recent_commits": "",
-                           "orchestrator_final": "", "pair": None})
+                           "orchestrator_final": "", "pair": None,
+                           "outcome": _outcome_for(rec, status),
+                           "work_evidence": work_evidence(rec.baseline)})
         raise
     finally:
         release_run_lock(rec)

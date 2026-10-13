@@ -25,9 +25,18 @@ from pathlib import Path
 REAL_LEDGER = Path.home() / ".hermes" / "quota" / "calls.jsonl"
 TOKENWATCH = Path.home() / ".hermes" / "scripts" / "tokenwatch.py"
 ENV_FLAG = "MULTIAGENT_LEDGER"
+#: Optional redirect, for tests and dry runs. tokenwatch resolves its own path
+#: at call time, so we patch the module attribute rather than editing anything.
+ENV_LEDGER_PATH = "MULTIAGENT_LEDGER_PATH"
 SOURCE_PREFIX = "multiagent-stack"
 
-__all__ = ["SOURCE_PREFIX", "ledger_enabled", "record"]
+__all__ = ["SOURCE_PREFIX", "ledger_enabled", "record", "target_ledger"]
+
+
+def target_ledger() -> Path:
+    """Where record() will write. Overridable so accounting is testable."""
+    override = (os.environ.get(ENV_LEDGER_PATH) or "").strip()
+    return Path(override).expanduser() if override else REAL_LEDGER
 
 
 def ledger_enabled() -> bool:

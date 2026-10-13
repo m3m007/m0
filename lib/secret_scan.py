@@ -195,12 +195,55 @@ def scan_file(path: Path, root: Path, live: dict[str, str] | None = None) -> lis
     return findings
 
 
+def scan_git_history(live: dict[str, str] | None = None,
+                     root: Path | None = None) -> list[str]:
+    """Scan every commit's diff, not just the working tree.
+
+    Why this exists separately: a secret committed and then deleted three commits
+    later is invisible to a working-tree scan and perfectly visible to anyone who
+    clones the repo. The brief's constraint is "no secrets in files/git/logs", and
+    git means history. Findings are attributed to the file the diff touches.
+
+    ``root`` must be honoured: an earlier version hardcoded this module's own repo,
+    so scanning any other path silently reported "history clean" while reading the
+    wrong repository -- a vacuous pass of exactly the kind the negative-control
+    tests exist to prevent.
+    """
+    import subprocess
+
+    target = Path(root or REPO_ROOT)
+    try:
+        proc = subprocess.run(["git", "log", "-p", "--all"], cwd=str(target),
+                              capture_output=True, text=True, check=False)
+    except OSError as exc:
+        return [f"<git>:0 [unavailable:{type(exc).__name__}]"]
+    if proc.returncode != 0:
+        return [f"<git>:0 [git-log-failed:{proc.stderr.strip()[:60]}]"]
+
+    findings: list[str] = []
+    current, line_no = "<header>", 0
+    for line in (proc.stdout or "").splitlines():
+        if line.startswith("commit "):
+            current = "<commit:" + line.split()[1][:10] + ">"
+            line_no = 0
+        elif line.startswith("diff --git "):
+            current = line.split(" b/")[-1] if " b/" in line else current
+            line_no = 0
+        line_no += 1
+        rule = scan_line(line, live)
+        if rule:
+            findings.append(f"{current}:{line_no} [history:{rule}]")
+    return findings
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Scan a tree for credential-shaped strings.")
     parser.add_argument("paths", nargs="*", default=None,
                         help="files/dirs to scan (default: repo root)")
     parser.add_argument("--verbose", action="store_true",
                         help="print the clean-file count too")
+    parser.add_argument("--history", action="store_true",
+                        help="also scan every commit's diff in git history")
     args = parser.parse_args(argv)
 
     root = REPO_ROOT
@@ -210,6 +253,15 @@ def main(argv: list[str] | None = None) -> int:
     findings: list[str] = []
     scanned = 0
     for target in targets:
+        if target == Path("/dev/stdin"):
+            # accept piped input (e.g. `git log -p | ... /dev/stdin`)
+            data = sys.stdin.read()
+            for number, line in enumerate(data.splitlines(), 1):
+                rule = scan_line(line, live)
+                if rule:
+                    findings.append(f"<stdin>:{number} [{rule}]")
+            scanned += 1
+            continue
         if target.is_dir():
             for path in iter_text_files(target):
                 scanned += 1
@@ -220,6 +272,11 @@ def main(argv: list[str] | None = None) -> int:
         else:
             findings.append(f"{target}:0 [missing]")
 
+    if args.history:
+        for hist_root in {str(Path(t).resolve().parent if Path(t).is_file()
+                             else Path(t).resolve()) for t in (args.paths or [root])}:
+            findings.extend(scan_git_history(live, Path(hist_root)))
+
     if findings:
         print(f"SECRET SCAN FAILED: {len(findings)} finding(s) in {scanned} file(s)")
         for finding in findings:
@@ -229,9 +286,11 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     if args.verbose:
         print(f"secret scan OK: {scanned} file(s) clean, "
-              f"{len(live)} live key(s) known for substring comparison")
+              f"{len(live)} live key(s) known for substring comparison"
+              + (", git history clean" if args.history else ""))
     else:
-        print(f"secret scan OK: {scanned} file(s) clean")
+        print(f"secret scan OK: {scanned} file(s) clean"
+              + (" + git history" if args.history else ""))
     return 0
 
 

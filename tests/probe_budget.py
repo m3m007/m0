@@ -91,6 +91,9 @@ def main(argv=None) -> int:
     ap.add_argument("--check", type=int, default=None,
                     help="exit 1 if our recorded total exceeds N")
     ap.add_argument("--json", action="store_true")
+    ap.add_argument("--since", type=float, default=None,
+                    help="only count ledger rows at/after this unix time "
+                         "(use a value captured before the run started)")
     args = ap.parse_args(argv)
 
     if args.record:
@@ -109,14 +112,26 @@ def main(argv=None) -> int:
         print(ledger_lines)
         return 0
 
+    # Cumulative-vs-per-run distinction, because conflating them lies about
+    # budget: the ceiling in router.yaml caps ONE team run, but the ledger has
+    # every run this session. After three live smoke runs the cumulative total
+    # (154) exceeds the per-run ceiling (100) while no single run ever did.
+    since = args.since if args.since is not None else 0.0
+    window_rows = [r for r in rows() if float(r.get("ts", 0)) >= since]
+    spent = sum(int(r.get("calls", 1)) for r in window_rows)
     ceiling = args.check if args.check is not None else ceiling_from_router()
     report = {
         "ledger": str(LEDGER),
         "ledger_lines": ledger_lines,
-        "our_recorded_requests": mine,
+        "our_recorded_requests_cumulative": mine,
+        "spent_since": spent,
+        "since": since or "session start",
         "by_model": by_model(),
         "per_run_ceiling": ceiling,
-        "within_ceiling": mine <= ceiling,
+        "within_ceiling": spent <= ceiling,
+        "note": ("within_ceiling compares the --since window to the per-run "
+                 "ceiling; cumulative totals will always exceed it once more "
+                 "than one run has happened"),
         "windows": None,
     }
     module = _load_tokenwatch()
@@ -129,7 +144,8 @@ def main(argv=None) -> int:
     if args.json:
         print(json.dumps(report, indent=2, default=str))
     else:
-        print(f"recorded by this repo : {mine} request(s)  (ceiling {ceiling})")
+        print(f"this window         : {spent} request(s) vs per-run ceiling {ceiling}")
+        print(f"cumulative (session): {mine} request(s)")
         for model, n in sorted(report["by_model"].items(), key=lambda kv: -kv[1]):
             print(f"   {model:32s} {n}")
         win = report.get("windows") or {}
@@ -138,9 +154,9 @@ def main(argv=None) -> int:
                   f"({data['pct']}%)")
         print("NOTE: local counts only — the provider console is the source of truth.")
         if not report["within_ceiling"]:
-            print(f"OVER CEILING: {mine} > {ceiling}")
+            print(f"OVER CEILING: this window spent {spent} > {ceiling}")
 
-    if args.check is not None and mine > args.check:
+    if args.check is not None and spent > args.check:
         return 1
     return 0
 

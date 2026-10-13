@@ -6,4 +6,4 @@ set -uo pipefail
 cd "$(dirname "$0")"
 PY="${MULTIAGENT_PY:-/home/hermes/.hermes/cache/scratch/oh-venv/bin/python}"
 [ -x "$PY" ] || PY="$(command -v python3)"
-exec "$PY" lib/secret_scan.py "$@"
+exec "$PY" lib/secret_scan.py --history "$@"
