@@ -4,7 +4,7 @@ AI coding agents claim success far too often. This harness makes their work prov
 
 Built on top of separate upstream projects (OpenHands SDK); not a fork. Improvements meant for upstreams go there as pull requests.
 
-## The four rules, enforced in code
+## 4 rules, enforced in code
 
 1. **Don't make calls that do nothing.** A mis-wired team once spent dozens of paid calls on agents whose tool list had silently parsed empty — they could not act and said nothing, 12 times in a row. Preflight now refuses any role that could not act; it costs zero requests to run. ([`repro/FINDINGS.md`](repro/FINDINGS.md))
 2. **Never make the worker re-read the blueprint.** Opening instructions are frozen byte-for-byte — no timestamps, no random run IDs in prompts — because a changed first sentence discards the prompt cache and you pay for the re-read.
@@ -65,7 +65,7 @@ $V repro/sdk_conversation.py       # one real agent turn
 Only then edit `router/router.yaml`. Its `probes:` block demands honest
 provenance: a tool-calling lane nobody probed cannot take traffic.
 
-## Honest limitations
+## Limitations
 
 - Sub-agent delegation has an unresolved tool-registration defect (`docs/DELEGATION-INCIDENT.md`); "multi-agent" here means one orchestrator over parallel role-scoped conversations where files are disjoint.
 - Cost is tracked in requests, not dollars — no price map exists for these lanes, and requests are the unit subscriptions actually bill.
