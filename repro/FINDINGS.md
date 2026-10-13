@@ -8,8 +8,8 @@ Cost of the investigation's decisive experiment: **0 API calls.**
 ## 1. Verdict in one paragraph
 
 The failure was **not** thinking-model handling, **not** `model_features.py`, and
-**not** the `anthropic/` transport. Both Token Plan endpoints return proper tool
-calls for `glm-5.3`, and a full OpenHands agent turn on `anthropic/glm-5.3`
+**not** the `anthropic/` transport. Both <lane> endpoints return proper tool
+calls for `<lane>`, and a full OpenHands agent turn on `<lane>`
 completes a real multi-step task with a 93% cache hit. The real defect is that
 **our sub-agents were spawned with zero executable tools** — they could only see
 `finish` and `think`. Each turn therefore produced neither a usable tool call nor
@@ -53,7 +53,7 @@ constructs. The failure only shows up as wasted quota minutes later.
 `subagent/registry.py:216-226` treats a non-`inherit` `model:` as a key into an
 `LLMProfileStore` and raises `ValueError: Profile ... not found in profile store`
 if absent. `~/.openhands/profiles` does not exist on this box, so the store is
-empty. `oh_team2/architect.md` sets `model: anthropic/deepseek-v4-pro`.
+empty. `oh_team2/architect.md` sets `model: <lane>`.
 
 **Interaction that matters:** RC1 *masked* RC2. Because metadata was ignored,
 `model` fell back to the default `"inherit"` (schema.py:345), so the profile
@@ -118,11 +118,11 @@ and it is exactly what the live `task` tool reports today (see §6).
 
 | # | Hypothesis | Source | Test | Result |
 |---|---|---|---|---|
-| H1 | **`model_features.py` curated lists lack our model ids → thinking misconfigured → empty turns** | the brief's own lead | `repro/show_kwargs.py` (0 calls): dump `get_features()` + outbound kwargs | **REFUTED.** `anthropic/glm-5.3` → `thinking_mode=none`, `supports_extended_thinking=False`, `send_reasoning_content=False`. `thinking_mode=none` means the SDK sends **no** thinking kwargs at all — there is nothing to misconfigure. Both lanes emit the identical 10-key kwarg set. |
+| H1 | **`model_features.py` curated lists lack our model ids → thinking misconfigured → empty turns** | the brief's own lead | `repro/show_kwargs.py` (0 calls): dump `get_features()` + outbound kwargs | **REFUTED.** `<lane>` → `thinking_mode=none`, `supports_extended_thinking=False`, `send_reasoning_content=False`. `thinking_mode=none` means the SDK sends **no** thinking kwargs at all — there is nothing to misconfigure. Both lanes emit the identical 10-key kwarg set. |
 | H2 | The `anthropic/` transport/endpoint is broken for tool calls | brief's framing | `repro/raw_curl.sh anthropic` (1 call) | **REFUTED.** `stop_reason=tool_use`, `blocks=['thinking','tool_use']`, `get_weather({"city": "Osaka"})`. |
 | H3 | LiteLLM mis-parses anthropic-messages tool responses | implied by H2 | `repro/ab_probe.py --lane both` (2 calls) | **REFUTED.** Both transports: `finish=tool_calls`, 1 tool call, valid JSON args. |
-| H4 | Failure is in the SDK layer above litellm (message formatting / response parsing) | — | `repro/sdk_conversation.py --lane anthropic` (1 call) | **REFUTED.** Real `Agent`+`Conversation` on `anthropic/glm-5.3` ran `TerminalAction` then `FinishAction`, wrote the file, task verified. |
-| H5 | `send_reasoning_content` gap causes it | brief's hint | `model_features.py:294` + `get_features` | **Real gap, irrelevant cause.** The list entry `deepseek/deepseek-v4-pro` never matches our id `anthropic/deepseek-v4-pro` because `model_matches` is case-insensitive *substring* matching (model_features.py:280 note) against a differently-prefixed id, and `capability_overrides` does not expose `send_reasoning_content` (verified in `tests/test_oh_compat.py`). Tool calling is unaffected. |
+| H4 | Failure is in the SDK layer above litellm (message formatting / response parsing) | — | `repro/sdk_conversation.py --lane anthropic` (1 call) | **REFUTED.** Real `Agent`+`Conversation` on `<lane>` ran `TerminalAction` then `FinishAction`, wrote the file, task verified. |
+| H5 | `send_reasoning_content` gap causes it | brief's hint | `model_features.py:294` + `get_features` | **Real gap, irrelevant cause.** The list entry `deepseek/<lane>` never matches our id `<lane>` because `model_matches` is case-insensitive *substring* matching (model_features.py:280 note) against a differently-prefixed id, and `capability_overrides` does not expose `send_reasoning_content` (verified in `tests/test_oh_compat.py`). Tool calling is unaffected. |
 | H6 | Missing `max_output_tokens` truncation (endpoint requires it) | — | kwargs dump + raw curl | **REFUTED as cause.** We send no `max_tokens` via the SDK and still get tool calls; raw curls that *did* set `max_tokens` also succeeded. |
 | H7 | **RC1/RC2/RC3 — tool wiring** | log grep | `repro/subagent_tools.py` (**0 calls**) | **CONFIRMED.** All four on-disk role files parse to `tools=[]`. Byte-identical file with `---` on line 1 parses to `['terminal','file_editor']`. |
 
@@ -142,7 +142,7 @@ from openhands.sdk import LLM
 from lib.keys import ANTHROPIC_BASE_URL, token_plan_key
 
 llm = LLM(
-    model="anthropic/glm-5.3",          # prefix MUST match the endpoint below
+    model="<lane>",          # prefix MUST match the endpoint below
     api_key=token_plan_key(),           # resolved at runtime; never a literal
     base_url=ANTHROPIC_BASE_URL,        # .../apps/anthropic
     streaming=False,                    # removes SSE-parsing variance

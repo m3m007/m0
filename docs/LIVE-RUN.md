@@ -1,7 +1,7 @@
 # Live run evidence — the team workflow against real endpoints
 
-Date: 2026-10-05 · Model lanes: `anthropic/glm-5.3` (architect),
-`openai/qwen3.8-flash` (fixers/tester), `openai/qwen3.8-max` (reviewer).
+Date: 2026-10-05 · Model lanes: `<lane>` (architect),
+`<lane>` (fixers/tester), `<lane>` (reviewer).
 Reproduce: `SMOKE_LIVE=1 python3 -m pytest tests/test_e2e_smoke.py -q -s`
 
 This is the raw report from the successful end-to-end run. Nothing here is
@@ -55,7 +55,7 @@ Does NOT prove:
 
 ## The path to this run was two real bugs, both mine
 
-1. **HTTP 400 on `openai/qwen3.8-flash`** — my router set
+1. **HTTP 400 on `<lane>`** — my router set
    `extra_body.enable_thinking=false` while the SDK kept injecting
    `reasoning_effort='high'`; the endpoint requires the pair to agree. Diagnosed
    with `repro/capture_request.py` at **zero API calls** and now refused at
@@ -74,10 +74,10 @@ reason the bug surfaced in the report instead of passing as a green run.
 
 | model | requests | role |
 |---|---|---|
-| `openai/qwen3.8-flash` | 123 | fixers / tester / orchestrator |
-| `anthropic/glm-5.3` | 17 | architect |
-| `openai/qwen3.8-max` | 12 | reviewer |
-| `openai/glm-5.3` | 2 | transport A/B probes |
+| `<lane>` | 123 | fixers / tester / orchestrator |
+| `<lane>` | 17 | architect |
+| `<lane>` | 12 | reviewer |
+| `<lane>` | 2 | transport A/B probes |
 
 Cumulative across the whole session (diagnosis + 3 live tests). The
 diagnosis phase — kwargs dump, role-file repro, request capture, bisecting the

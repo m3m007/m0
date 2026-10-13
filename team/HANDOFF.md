@@ -38,14 +38,14 @@ hunch about what it "probably" supports.
 ### What the team actually does with it
 
 ```
-architect  (anthropic/glm-5.3)   reads BRIEF.md → writes TEAM-SPEC.json
+architect  (<lane>)   reads BRIEF.md → writes TEAM-SPEC.json
    ↓                              {id, role, instruction, paths, acceptance}
 fixers  ── parallel ──┐           disjoint paths only; the orchestrator refuses
 fixers  ── parallel ──┘           an overlap before spending anything
    ↓
-tester     (openai/qwen3.8-flash) runs the gates, depends_on the fixers
+tester     (<lane>) runs the gates, depends_on the fixers
    ↓
-reviewer   (openai/qwen3.8-max)   re-runs every gate, writes DONE.md
+reviewer   (<lane>)   re-runs every gate, writes DONE.md
 ```
 
 Each step also writes its own `DONE-<id>.md`. Per-task, not shared: a single
@@ -122,14 +122,14 @@ wrong.
 
 | role | lane | model | transport | in-loop? | probe status |
 |---|---|---|---|---|---|
-| architect | architect | `anthropic/glm-5.3` | apps/anthropic | yes | verified_here |
-| research | architect | `anthropic/glm-5.3` | apps/anthropic | yes | verified_here |
-| fallback_architect | fallback_architect | `anthropic/deepseek-v4-pro` | apps/anthropic | yes | verified_in_brief |
-| fixer | implementer | `openai/qwen3.8-flash` | compatible-mode | yes | verified_here (after the 400 fix) |
-| implementer | implementer | `openai/qwen3.8-flash` | compatible-mode | yes | verified_here |
-| tester | tester | `openai/qwen3.8-flash` | compatible-mode | yes | verified_in_brief |
-| reviewer | reviewer | `openai/qwen3.8-max` | compatible-mode | yes | verified_in_brief |
-| orchestrator | implementer | `openai/qwen3.8-flash` | compatible-mode | yes | verified_here |
+| architect | architect | `<lane>` | apps/anthropic | yes | verified_here |
+| research | architect | `<lane>` | apps/anthropic | yes | verified_here |
+| fallback_architect | fallback_architect | `<lane>` | apps/anthropic | yes | verified_in_brief |
+| fixer | implementer | `<lane>` | compatible-mode | yes | verified_here (after the 400 fix) |
+| implementer | implementer | `<lane>` | compatible-mode | yes | verified_here |
+| tester | tester | `<lane>` | compatible-mode | yes | verified_in_brief |
+| reviewer | reviewer | `<lane>` | compatible-mode | yes | verified_in_brief |
+| orchestrator | implementer | `<lane>` | compatible-mode | yes | verified_here |
 
 `verified_here` = probed on this machine, today, output captured.
 `verified_in_brief` = the owner's live probes assert it; nobody re-checked here.
