@@ -1,203 +1,69 @@
-# FINDINGS. Why the OpenHands team run produced "no tool call and no content"
+# FINDINGS. "No tool call and no content" in the OpenHands team run
 
-Date: 2026-10-05 · Investigated in: `/home/hermes/projects/multiagent-stack`
-Cost of the investigation's decisive experiment: **0 API calls.**
+Date: 2026-10-05 · Decisive experiment cost: **0 API calls.**
 
----
+## Verdict
 
-## 1. Verdict in one paragraph
+Not thinking-model handling, not `model_features.py`, not the transport. Endpoints return proper tool calls; a full agent turn completes real tasks with 93% cache hit. The defect: **sub-agents spawned with zero executable tools** (only `finish`/`think`). Each turn produced neither tool call nor text, corrective feedback looped until the stuck-detector killed it. Three usage errors on our side, and none of them raise.
 
-The failure was **not** thinking-model handling, **not** `model_features.py`, and
-**not** the `anthropic/` transport. Both <lane> endpoints return proper tool
-calls for `<lane>`, and a full OpenHands agent turn on `<lane>`
-completes a real multi-step task with a 93% cache hit. The real defect is that
-**our sub-agents were spawned with zero executable tools**. They could only see
-`finish` and `think`. Each turn therefore produced neither a usable tool call nor
-text, the framework injected corrective feedback, and the loop repeated until the
-stuck-detector killed the task. Three separate usage errors on our side caused
-it, and the SDK's sin is that **none of them raise**.
+## Root causes
 
-## 2. Root causes
-
-### RC1. Role Markdown frontmatter was not on line 1 (primary cause)
-
-Our role files open with a title line:
+**RC1 (primary): role frontmatter not on line 1.** Files open with a title line; python-frontmatter only parses when line 1 is exactly `---`:
 
 ```markdown
-# architect
+# architect        <- this line kills parsing
 ---
 name: architect
-tools:
-  - terminal
-  - file_editor
+tools: [terminal, file_editor]
 ---
 ```
 
-`openhands/sdk/subagent/schema.py:338` does `frontmatter.load(f)`, and
-python-frontmatter only recognises frontmatter when the **first line** is exactly
-`---`. With a heading in the way, `post.metadata` is `{}`. So:
+Chain: `_extract_tools({})` → `[]` → registry builds empty list → `Loaded 0 tools from spec` → built-ins only (`FinishTool`, `ThinkTool`) → `Tool 'terminal' not found. Available: ['finish', 'think']`. Nothing raises; failure surfaces later as wasted quota. (`schema.py:338`, `registry.py:243-250`, `base.py:596`, `agent.py:1349`)
 
-- `schema.py:57 _extract_tools({})` → `[]`
-- `subagent/registry.py:243-250` builds an empty tool list
-- `agent/base.py:596` logs `Loaded 0 tools from spec`
-- the agent gets only the built-ins (`agent/base.py:163`: `include_default_tools`
-  defaults to `FinishTool`, `ThinkTool`)
-- `agent/agent.py:1349-1352` then logs `Tool 'terminal' not found. Available:
-  ['finish', 'think']`
+**RC2: `model:` in a role file is a profile name, not a model id.** Non-`inherit` values key into `LLMProfileStore`; `~/.openhands/profiles` doesn't exist here → `ValueError` at spawn. RC1 masked RC2 (ignored metadata fell back to `inherit`). Fix both together or you trade a silent loop for a hard crash.
 
-**Nothing raises.** The file is valid Markdown, the definition loads, the agent
-constructs. The failure only shows up as wasted quota minutes later.
+**RC3: the tool registry populates lazily.** Validating declared tools before `get_default_tools()` is imported raises `Tool 'terminal' not registered`. Load the preset first, always.
 
-### RC2. `model:` in a role file is a PROFILE NAME, not a model id
+## Evidence
 
-`subagent/registry.py:216-226` treats a non-`inherit` `model:` as a key into an
-`LLMProfileStore` and raises `ValueError: Profile ... not found in profile store`
-if absent. `~/.openhands/profiles` does not exist on this box, so the store is
-empty. `oh_team2/architect.md` sets `model: <lane>`.
+From `oh-netflow-team.log`: `Loaded 0 tools from spec` ×9, `LLM response contained no tool call and no content` ×12, `Tool 'X' not found` ×6 (`terminal`×2, `file_editor`×1, `run_bash`×2, `tool`×1). Warning path: `response_dispatch.py:364-371` `_send_corrective_nudge` via `classify_response` (returns EMPTY only when no tool_calls AND no text AND no reasoning blocks). `['finish', 'think']` is RC1's fingerprint.
 
-**Interaction that matters:** RC1 *masked* RC2. Because metadata was ignored,
-`model` fell back to the default `"inherit"` (schema.py:345), so the profile
-lookup never ran. Fix RC1 alone and the run trades a silent loop for a hard
-crash at spawn. Both must be fixed together.
+## Refuted hypotheses
 
-### RC3. The tool registry is populated lazily
+| # | Hypothesis | Test | Result |
+|---|---|---|---|
+| H1 | curated `model_features.py` lists misconfigure thinking into empty turns | `show_kwargs.py` (0 calls) | REFUTED: `thinking_mode=none` sends no thinking kwargs, nothing to misconfigure; both lanes emit identical 10-key sets |
+| H2 | anthropic transport broken for tools | `raw_curl.sh` (1 call) | REFUTED: clean `stop_reason=tool_use` |
+| H3 | litellm mis-parses responses | `ab_probe.py` (2 calls) | REFUTED: both transports fine |
+| H4 | SDK layer above litellm | `sdk_conversation.py` (1 call) | REFUTED: full turn works |
+| H5 | `send_reasoning_content` gap | code read + test | Real gap, irrelevant cause: substring-match quirk never hits our ids; tool calling unaffected |
+| H6 | missing `max_output_tokens` | kwargs + curl | REFUTED: succeeds with and without |
+| H7 | RC1/RC2/RC3 tool wiring | `subagent_tools.py` (**0 calls**) | CONFIRMED: all role files parse `tools=[]`; same bytes with `---` on line 1 parse correctly |
 
-`agent_definition_to_factory` validates declared tools against
-`list_registered_tools()`. That registry is empty (`['ClassifyAndSwitchLLMTool']`)
-until `openhands.tools.preset.default.get_default_tools()` is imported/called.
-Registering a sub-agent before that import raises `Tool 'terminal' not registered`.
-Every team runner must load the preset first.
+Grep lesson: the logger truncates the warning to `LLM response contained no`; search fragments, not sentences.
 
-## 3. Evidence chain, verbatim
+## Correct `LLM(...)` shape
 
-From `~/.hermes/cache/scratch/oh-netflow-team.log` (log wraps its own columns;
-read it as printed):
+Via `fix/oh_compat.correct_llm_kwargs()`: prefix must match base_url, `streaming=False`, `drop_params=True`, retries set, key resolved at runtime. Pinned traps:
 
-```
-[10/05/26 01:26:26] INFO     Loaded 0 tools from spec                base.py:596
-[10/05/26 01:26:31] ERROR    Tool 'terminal' not found. Available: agent.py:1352
-                             ['finish', 'think']
-[10/05/26 01:26:31] ERROR    Tool 'terminal' not found. Available: agent.py:1352
-                             ['finish', 'think']
-[10/05/26 01:27:44] WARNING  LLM response contained no  response_dispatch.py:370
-                             tool call and no content -
-                             sending corrective
-                             feedback
-[10/05/26 01:29:05] WARNING  LLM response contained no  response_dispatch.py:370
-[10/05/26 01:30:26] WARNING  LLM response contained no  response_dispatch.py:370
-[10/05/26 01:30:26] WARNING  Stuck pattern detected.   local_conversation.py:761
-[10/05/26 01:30:26] WARNING  Task 'task_00000001' stopped: status manager.py:425
-                             'stuck'.
-```
+- `max_iteration_per_run` / `max_budget_per_run` are NOT `LLM` fields (pydantic `extra="ignore"` silently drops them). Iterations go on `Conversation`; budget + `prompt_cache_key` only on `LocalConversation`.
+- Mismatched prefix/base_url → opaque HTTP 400; `validate_lane()` rejects pre-spend.
+- `capability_overrides` exists (`llm.py:459`) but does not expose `send_reasoning_content` (curated-list only).
 
-Counts in that log: `Loaded 0 tools from spec` ×9, `LLM response contained no
-tool call and no content` ×12, `Tool 'X' not found` ×6
-(`terminal` ×2, `file_editor` ×1, `run_bash` ×2, `tool` ×1).
+## Still live
 
-The warning text comes from `agent/response_dispatch.py:364-371`
-(`_send_corrective_nudge`), reached via
-`_handle_no_content_response` (response_dispatch.py:272-301), whose classifier is
-`classify_response` (response_dispatch.py:54-80):
+The orchestrator's own `task` tool reports `['finish', 'think']`, the same fingerprint; delegation channel affected (`docs/DELEGATION-INCIDENT.md`). Likely fix: role files in a scanned dir (`~/.openhands/agents` etc., none exist here) with frontmatter on line 1 + RC3 import order. Untested, deliberately not applied mid-session; tracked as unfinished work.
 
-```python
-    if message.tool_calls:
-        return LLMResponseType.TOOL_CALLS
-    if any(isinstance(c, TextContent) and c.text.strip() for c in message.content):
-        return LLMResponseType.CONTENT
-    if (message.responses_reasoning_item is not None
-            or message.reasoning_content is not None
-            or message.thinking_blocks):
-        return LLMResponseType.REASONING_ONLY
-    return LLMResponseType.EMPTY
-```
-
-Note the log line "Available: `['finish', 'think']`". That is RC1's fingerprint,
-and it is exactly what the live `task` tool reports today (see section 6).
-
-## 4. Hypotheses tested and killed
-
-| # | Hypothesis | Source | Test | Result |
-|---|---|---|---|---|
-| H1 | **`model_features.py` curated lists lack our model ids, so thinking gets misconfigured into empty turns** | the brief's own lead | `repro/show_kwargs.py` (0 calls): dump `get_features()` + outbound kwargs | **REFUTED.** `<lane>` → `thinking_mode=none`, `supports_extended_thinking=False`, `send_reasoning_content=False`. `thinking_mode=none` means the SDK sends **no** thinking kwargs at all, so there is nothing to misconfigure. Both lanes emit the identical 10-key kwarg set. |
-| H2 | The `anthropic/` transport/endpoint is broken for tool calls | brief's framing | `repro/raw_curl.sh anthropic` (1 call) | **REFUTED.** `stop_reason=tool_use`, `blocks=['thinking','tool_use']`, `get_weather({"city": "Osaka"})`. |
-| H3 | LiteLLM mis-parses anthropic-messages tool responses | implied by H2 | `repro/ab_probe.py --lane both` (2 calls) | **REFUTED.** Both transports: `finish=tool_calls`, 1 tool call, valid JSON args. |
-| H4 | Failure is in the SDK layer above litellm (message formatting / response parsing) | n/a | `repro/sdk_conversation.py --lane anthropic` (1 call) | **REFUTED.** Real `Agent`+`Conversation` on `<lane>` ran `TerminalAction` then `FinishAction`, wrote the file, task verified. |
-| H5 | `send_reasoning_content` gap causes it | brief's hint | `model_features.py:294` + `get_features` | **Real gap, irrelevant cause.** The list entry `deepseek/<lane>` never matches our id `<lane>` because `model_matches` is case-insensitive *substring* matching (model_features.py:280 note) against a differently-prefixed id, and `capability_overrides` does not expose `send_reasoning_content` (verified in `tests/test_oh_compat.py`). Tool calling is unaffected. |
-| H6 | Missing `max_output_tokens` truncation (endpoint requires it) | n/a | kwargs dump + raw curl | **REFUTED as cause.** We send no `max_tokens` via the SDK and still get tool calls; raw curls that *did* set `max_tokens` also succeeded. |
-| H7 | **RC1/RC2/RC3, tool wiring** | log grep | `repro/subagent_tools.py` (**0 calls**) | **CONFIRMED.** All four on-disk role files parse to `tools=[]`. Byte-identical file with `---` on line 1 parses to `['terminal','file_editor']`. |
-
-Also corrected along the way: the brief cites `oh-netflow-team.log` for
-timestamps 01:27/01:34/01:54, and that file does contain them (section 3). My first grep
-missed it because I searched the full sentence while the logger **truncates** the
-message to `LLM response contained no`. A reminder to grep on fragments, not
-assumptions.
-
-## 5. What `LLM(...)` should look like
-
-`fix/oh_compat.correct_llm_kwargs()` produces it; see `fix/README.md` for the
-rationale and `tests/test_oh_compat.py` for the proofs.
-
-```python
-from openhands.sdk import LLM
-from lib.keys import ANTHROPIC_BASE_URL, token_plan_key
-
-llm = LLM(
-    model="<lane>",          # prefix MUST match the endpoint below
-    api_key=token_plan_key(),           # resolved at runtime; never a literal
-    base_url=ANTHROPIC_BASE_URL,        # .../apps/anthropic
-    streaming=False,                    # removes SSE-parsing variance
-    temperature=0.0,
-    drop_params=True,
-    retry_max_attempts=3, retry_multiplier=2.0,
-    retry_min_wait=2, retry_max_wait=30,
-    # OPTIONAL public override hook (llm.py:459). The brief asked whether one
-    # exists. It does, and it is the right lever if a lane ever needs thinking:
-    # capability_overrides={"thinking_mode": "manual", "supports_prompt_cache": True},
-)
-```
-
-Traps the tests pin down:
-- **`max_iteration_per_run` / `max_budget_per_run` are not `LLM` fields.** `LLM`
-  uses pydantic `extra="ignore"`, so passing them **silently does nothing**.
-  `max_iteration_per_run` belongs on `Conversation`; `max_budget_per_run` and
-  `prompt_cache_key` exist only on `LocalConversation` (verified against
-  `LocalConversation.__init__` varnames).
-- **`anthropic/x` with a `compatible-mode` base_url** (or vice versa) answers an
-  opaque HTTP 400. `validate_lane()` rejects it before any spend.
-- **`send_reasoning_content` is not overridable**, curated-list only (H5).
-
-## 6. This is not merely historical
-
-My own sub-agents in this very session reported:
-
-> Available tools in this session: `finish`, `think` … `NO_EXEC_TOOLS`
-
-`['finish', 'think']` is precisely RC1's fingerprint. The live `task` tool is
-reading role files that suffer the same leading-title-line frontmatter problem,
-so **the delegation channel of this orchestrator is affected by the same root
-cause**. Details and the consequences are in
-`docs/DELEGATION-INCIDENT.md`.
-
-Candidate remedy (untested, and deliberately not applied): the discovered search
-paths are `~/.agents/agents`, `~/.openhands/agents`, `<project>/.agents/agents`,
-`<project>/.openhands/agents`; **none exist on this box**. Re-creating the role
-files there with frontmatter on line 1, plus RC3's preset import, is the
-likely fix. I am not editing the orchestrator's own runtime configuration
-mid-session on the strength of an untested inference. That is a follow-up, and
-it is listed in `DONE.md` as unfinished work rather than claimed as done.
-
-## 7. Reproduce it yourself
+## Reproduce
 
 ```bash
 V=/home/hermes/.hermes/cache/scratch/oh-venv/bin/python
-$V repro/subagent_tools.py            # 0 calls: the root cause, deterministically
-$V repro/show_kwargs.py --json        # 0 calls: the kwargs the SDK really sends
-./repro/raw_curl.sh both              # 2 calls: both endpoints, raw, healthy
-$V repro/ab_probe.py --lane both      # 2 calls: litellm layer, both transports
-$V repro/sdk_conversation.py --lane anthropic   # 1 call: full agent turn works
-$V -m pytest tests/ -q                # 0 calls: 43 tests, all offline
+$V repro/subagent_tools.py            # 0 calls: root cause, deterministic
+$V repro/show_kwargs.py --json        # 0 calls: real outbound kwargs
+./repro/raw_curl.sh both              # 2 calls: endpoints healthy
+$V repro/ab_probe.py --lane both      # 2 calls: litellm layer
+$V repro/sdk_conversation.py --lane anthropic   # 1 call: full turn works
+$V -m pytest tests/ -q                # 0 calls: all offline
 ```
 
-`runs/` is gitignored; every capture passes through `lib.keys.redact()` on the
-way to disk, and `lib/secret_scan.py` blocks a commit if anything credential-shaped
-appears anywhere in the tree.
+`runs/` gitignored; captures pass `lib.keys.redact()`; `lib/secret_scan.py` blocks credential-shaped commits.
