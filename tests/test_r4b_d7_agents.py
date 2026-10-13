@@ -67,6 +67,17 @@ from tests.test_runrecord import install_oh_stubs  # noqa: E402
 REAL_PREFLIGHT = tk.preflight
 
 
+@pytest.fixture(autouse=True)
+def runs_env(tmp_path, monkeypatch):
+    """Autouse, on purpose: whole-run tests here call run_team() for real, and a
+    record left in the repo's own runs/ pollutes the evidence trail the suite is
+    supposed to be auditing (the same reason tests/test_runrecord.py does this).
+    """
+    monkeypatch.setenv("TEAMKIT_RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.delenv("TEAMKIT_DRY_RUN", raising=False)
+    return tmp_path / "runs"
+
+
 ROLE_MD = """---
 name: {name}
 description: {name} role
