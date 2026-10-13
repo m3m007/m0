@@ -30,10 +30,12 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures as cf
+import hashlib
 import json
 import os
 import re
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -51,6 +53,11 @@ from fix.oh_compat import (RoleFileError, assert_runnable, ensure_tools_register
 from router import Router, RouterError  # noqa: E402
 
 ROLES_DIR = HERE / "roles"
+
+#: wall clock minus monotonic clock, sampled once at import. Adding it turns
+#: ``time.monotonic()`` into a never-moving-backwards timestamp that is still
+#: comparable with ``stat().st_mtime`` (see Team._spec_start_stamp).
+_MONO_TO_WALL = time.time() - time.monotonic()
 
 #: The Task-Z self-wake line, appended verbatim to every task.
 #:
@@ -350,6 +357,138 @@ class Team:
     def _spec_path(self, override: str | Path | None) -> Path:
         return Path(override) if override else (self.workspace / "TEAM-SPEC.json")
 
+    @staticmethod
+    def _spec_start_stamp() -> float:
+        """Freshness boundary for the spec file: monotone, wall-clock aligned.
+
+        Compared against ``stat().st_mtime``, a wall-clock reading, so the two
+        need a shared zero point: the monotone clock plus the wall-minus-monotone
+        offset sampled at import. It therefore never moves backwards (an NTP step
+        mid-run cannot un-stale a file the way a bare ``time.time()`` could) while
+        still being meaningful against mtimes.
+        """
+        return time.monotonic() + _MONO_TO_WALL
+
+    @staticmethod
+    def _spec_signature(spec_path: Path) -> tuple | None:
+        """Identity of the spec file right now: ``(mtime, size, content hash)``.
+
+        None when there is no file. Two equal signatures mean nothing was
+        written in between. The content hash is what makes the stale check safe
+        on filesystems with coarse timestamps: a real rewrite changes the bytes
+        even when the clock is too blunt to show a new mtime.
+        """
+        try:
+            stat = spec_path.stat()
+            digest = hashlib.sha256(spec_path.read_bytes()).hexdigest()
+        except OSError:
+            return None
+        return (stat.st_mtime, stat.st_size, digest)
+
+    def _spec_attempt(self, brief_path: Path, spec_path: Path) -> Task:
+        """The architect's spec task, as ONE literal.
+
+        The retry reuses this exact instruction rather than inventing a second
+        phrasing: a re-ask that drifts is an opinion nobody can compare with the
+        first attempt, and any timestamp or run id in it would break the frozen
+        prompt prefix (rule 2).
+        """
+        return Task(
+            id="spec", role="architect",
+            instruction=(
+                "Read the brief at " + str(brief_path) + ". Produce a numbered "
+                "task spec for fixers and testers working in parallel in this "
+                "workspace. WRITE THE SPEC TO THE FILE " + str(spec_path) + " as "
+                "a JSON array of objects with keys: id, role, instruction, "
+                "paths (files that task alone may touch), acceptance (commands "
+                "that must exit 0). Paths must be DISJOINT across tasks or the "
+                "run will be refused. Then repeat the same array in a fenced "
+                "json block in your reply. Do not edit any other file."),
+            paths=(str(spec_path),), acceptance=())
+
+    def _spec_is_fresh(self, spec_path: Path, started: float,
+                       before: tuple | None) -> bool:
+        """Does the spec file, as it stands, count as THIS step's work?
+
+        Absent means no. So does a file that was already here before the step
+        was sent, is unchanged since (same mtime, size and content), and predates
+        the step: that is last run's leftover, not this architect's plan. The
+        identity check is what protects a file the architect legitimately wrote,
+        because filesystem timestamps are coarse: a real rewrite changes the
+        bytes or the size even when the clock is too blunt to show a new mtime.
+        """
+        now = self._spec_signature(spec_path)
+        if now is None:
+            return False
+        return not (before is not None and now == before and now[0] < started)
+
+    def _spec_file_state(self, spec_path: Path, started: float,
+                         before: tuple | None) -> tuple[list[Task], bool, str]:
+        """Read and validate the spec FILE: ``(tasks, file_exists, reason)``.
+
+        A file counts as a plan ONLY when it is fresh AND parses to at least one
+        Task. The reason codes exist so ``report["spec_validation"]`` can still
+        answer "why did that run ignore the file?" months later:
+
+          missing      nothing at the spec path
+          stale        the file was already here when the step started, is
+                       unchanged since, and predates the step: last run's
+                       leftovers, or another process's content. A stale spec is
+                       a silent wrong plan, so its contents are never used.
+          unreadable   present but not readable as text
+          unparseable  not JSON, and no fenced JSON block in it either
+          no-tasks     valid JSON that holds no tasks, so not a plan
+          empty        a zero-byte file
+          valid        one or more Tasks
+        """
+        if not spec_path.is_file():
+            return [], False, "missing"
+        if not self._spec_is_fresh(spec_path, started, before):
+            return [], False, "stale"
+        try:
+            text = spec_path.read_text(encoding="utf-8")
+        except Exception as exc:
+            return [], True, f"unreadable:{type(exc).__name__}"
+        try:
+            rows = parse_spec_json(text)
+        except Exception as exc:
+            return [], True, f"unparseable:{type(exc).__name__}"
+        if rows:
+            return rows, True, "valid"
+        if not text.strip():
+            return [], True, "empty"
+        # Nothing usable, and which kind matters: a file that is not JSON at
+        # all, and a file of valid JSON holding no tasks, are different problems
+        # for whoever reads the report.
+        try:
+            json.loads(text)
+        except Exception:
+            return [], True, "unparseable"
+        return [], True, "no-tasks"
+
+    def _spec_validation(self, spec_path: Path, started: float,
+                         before: tuple | None, reply_text: str,
+                         parse_reply: Callable[[str], list[Task]],
+                         ) -> tuple[list[Task], str | None, dict[str, Any]]:
+        """Resolve one spec attempt into ``(tasks, source, validation)``.
+
+        File first, reply second, and the file only counts when it is fresh and
+        parses to at least one Task. ``source`` stays None when both come up
+        empty, which is the signal that the spec step has to be re-asked rather
+        than a plan to run.
+        """
+        file_tasks, file_exists, reason = self._spec_file_state(
+            spec_path, started, before)
+        reply_tasks = parse_reply(reply_text)
+        tasks, source = file_tasks, ("file" if file_tasks else None)
+        if not tasks and reply_tasks:
+            tasks, source = reply_tasks, "reply"
+        validation = {"file_exists": file_exists,
+                      "file_tasks": len(file_tasks),
+                      "file_reason": reason,
+                      "reply_tasks": len(reply_tasks)}
+        return tasks, source, validation
+
     def run_task(self, task: Task) -> AgentResult:
         """Run one task through its role. This spends real requests."""
         role = task.role if task.role in self.defs else "fixer"
@@ -479,6 +618,17 @@ class Team:
         repo's own probes), which would silently yield zero tasks. A file either
         exists with valid JSON in it or it does not — there is no quiet middle.
 
+        Validation is explicit, because two live runs showed the quiet middle
+        anyway: the architect wrote a spec, ended its turn with a few characters
+        of reply, and the old flow fell through file-then-reply into "no
+        parseable task spec" while the reviewer carried on grading nothing. So
+        the file is validated first (it counts ONLY if it parses to >= 1 Task and
+        is not stale), the reply is the fallback, and when both yield zero the
+        spec step is re-asked ONCE through the normal accounting path. Every run
+        records ``report["spec_validation"]`` (what each source yielded) and
+        ``report["spec_attempts"]`` (1 or 2), next to the existing
+        ``spec_source`` / ``tasks_parsed`` keys.
+
         ``spec_parser`` turns free text into Tasks when the file is absent; it
         defaults to :func:`parse_tasks`, which reads a fenced JSON block. Pass
         something stricter for production: a loosely parsed spec is how two
@@ -490,40 +640,61 @@ class Team:
         report: dict[str, Any] = {"steps": [], "requests_charged": 0,
                                   "spec_file": str(spec_path),
                                   "cleared_stale_status_files": stale}
-        spec_result = self.run_task(Task(
-            id="spec", role="architect",
-            instruction=(
-                "Read the brief at " + str(brief_path) + ". Produce a numbered "
-                "task spec for fixers and testers working in parallel in this "
-                "workspace. WRITE THE SPEC TO THE FILE " + str(spec_path) + " as "
-                "a JSON array of objects with keys: id, role, instruction, "
-                "paths (files that task alone may touch), acceptance (commands "
-                "that must exit 0). Paths must be DISJOINT across tasks or the "
-                "run will be refused. Then repeat the same array in a fenced "
-                "json block in your reply. Do not edit any other file."),
-            paths=(str(spec_path),), acceptance=()))
-        report["steps"].append(self._as_dict(spec_result))
-        if not spec_result.ok:
-            report["aborted"] = "architect failed: " + str(spec_result.error)
+        parse_reply = spec_parser or parse_tasks
+        # Freshness boundary for the stale-file guard: ONE stamp, taken before
+        # the first spec step is sent and reused for every validation in this
+        # run, paired with the file's signature at the same moment. A
+        # TEAM-SPEC.json left by an earlier run predates the stamp and is
+        # unchanged since, so it is not this architect's plan however valid its
+        # JSON; a file the architect writes during the step is newer or differs.
+        started = self._spec_start_stamp()
+        before = self._spec_signature(spec_path)
+        attempts = 0
+        spent: list[int] = []
+
+        def spec_step() -> AgentResult:
+            """Send the spec step, accounted through run_task like any other.
+
+            Each call appends one entry to ``report["steps"]`` and spends
+            through run_task -> _charge: the retry is an ordinary step, not a
+            bypass, so it cannot quietly get past the request ceiling.
+            """
+            nonlocal attempts
+            before_requests = self._requests
+            attempts += 1
+            result = self.run_task(self._spec_attempt(brief_path, spec_path))
+            report["steps"].append(self._as_dict(result))
+            spent.append(self._requests - before_requests)
+            return result
+
+        def resolve(result: AgentResult) -> list[Task]:
+            """Validate file-then-reply for the latest attempt and record it."""
+            tasks, src, validation = self._spec_validation(
+                spec_path, started, before, result.text, parse_reply)
+            report["spec_validation"] = validation
+            report["spec_attempts"] = attempts
+            report["spec_requests_spent"] = spent
+            report["spec_source"] = src
+            report["tasks_parsed"] = len(tasks)
+            if validation["file_reason"] not in ("valid", "missing"):
+                report["warnings"] = (report.get("warnings") or []) + [
+                    f"spec file present but {validation['file_reason']}; its "
+                    "contents were ignored rather than run as a plan"]
+            return tasks
+
+        attempt = spec_step()
+        tasks = resolve(attempt)
+        if not attempt.ok:
+            report["aborted"] = "architect failed: " + str(attempt.error)
             report["requests_charged"] = self._requests
             return report
-
-        tasks: list[Task] = []
-        source = None
-        if spec_path.is_file():
-            try:
-                tasks = parse_spec_json(spec_path.read_text(encoding="utf-8"))
-                if tasks:
-                    source = "file"
-            except Exception as exc:
-                report["warnings"] = (report.get("warnings") or []) + [
-                    f"spec file present but unparseable: {type(exc).__name__}"]
         if not tasks:
-            tasks = (spec_parser or parse_tasks)(spec_result.text)
-            if tasks:
-                source = "reply"
-        report["spec_source"] = source
-        report["tasks_parsed"] = len(tasks)
+            # Both sources empty on the first pass: re-ask ONCE. Same
+            # instruction, same accounting -- run_task -> _charge -- so the
+            # retry cannot slip past the request ceiling any more than any
+            # other step can. A second failure keeps the previous behaviour
+            # exactly: warn loudly, skip fixers, let the reviewer run anyway.
+            tasks = resolve(spec_step())
         if not tasks:
             # Loud, never silent: an architect that produced no task list is a
             # failed step, and skipping fixers quietly would let the run report
@@ -727,7 +898,10 @@ def main(argv: list[str] | None = None) -> int:
         spent = report["requests_charged"]
         print(f"\nDRY RUN: steps={len(report['steps'])} "
               f"tasks_parsed={report.get('tasks_parsed')} "
-              f"spec_source={report.get('spec_source')} requests={spent}")
+              f"spec_source={report.get('spec_source')} "
+              f"spec_attempts={report.get('spec_attempts')} "
+              f"spec_validation={report.get('spec_validation')} "
+              f"requests={spent}")
         if report.get("warnings"):
             for w in report["warnings"]:
                 print("WARNING: " + w)
