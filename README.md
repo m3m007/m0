@@ -221,9 +221,9 @@ $V -m pytest tests/ -q                            # config self-consistency
 
 ---
 
-## `team/teamkit.py` — run records, pair acceptance, budget chokepoint (R1)
+## `team/teamkit.py` — run records, pair acceptance, budget chokepoint, outcome split (R1+R2)
 
-`teamkit.run_team()` is the sanctioned single-lane launcher. Three disciplines
+`teamkit.run_team()` is the sanctioned single-lane launcher. Four disciplines
 sit around the original flow (preflight → lane check → register agents → send +
 run → gate → lessons → git diff/log); none of them replace it.
 
@@ -238,7 +238,7 @@ gets `-2`, so records never overwrite each other):
 |---|---|
 | `config.json` | resolved workspace / model / base_url / budget_calls / roles / contract **verbatim**, plus `brief_sha256` — the hash of the brief text, never the text |
 | `state.json` | status + `attempts` for `preflight`, `team_run`, `gate`, `lessons`. A stage that raised is recorded with `TypeError: <message tail, last 300 chars>` and the record is still written |
-| `summary.json` | exactly the dict `run_team()` returned, plus `run_dir` |
+| `summary.json` | exactly the dict `run_team()` returned, plus `run_dir` — so it carries `outcome` and `work_evidence` too (D4) |
 | `retained.json` | only for gate v2: `{accepted, baseline_ref, head_ref, g_new, g_base}` |
 
 Recording is wrapped so a failure **inside** it can never crash a run or change
@@ -297,6 +297,44 @@ neither can spend anything:
 
 `team/run_team.py`'s own `--plan` / `--dry-run` flags are a different code path
 and are untouched.
+
+### Outcome split (D4) — did the system fail, or did it do nothing?
+
+Every returned dict and every `summary.json` now carries `outcome`, one of five
+values. The rule is a *git* rule, never prose: `git rev-list --count
+<baseline HEAD>..<HEAD>` for commits, plus a digest comparison of
+`git diff HEAD` and `git status --porcelain -uall` between the fingerprint taken
+at run start and the one taken the instant the team stops.
+
+| outcome | rule |
+|---|---|
+| `success` | status in {`GATE_PASS`, `GATE_PASS_NEW`} — the pair gate accepted |
+| `partial_work` | status in {`GATE_FAIL`, `RUN_DONE_NO_GATE`, `ERROR`} **and** new commits since run start **or** a non-empty tracked diff produced during the run |
+| `abstained` | same statuses **and** zero new commits **and** no diff/dirt change — ran N minutes, touched nothing (the ~10-min flash-lane stall class) |
+| `refused` | `BUDGET_REFUSED` / `DRY_PLAN` / any pre-API early return, including an `ERROR` raised before `conv.run()` started. Zero spend, so zero business in failure stats |
+| `tie_kept` | `GATE_PASS_TIE` — retained, but not proven better |
+
+**abstention ≠ failure**: a stall that produced nothing needs a *lane* fix
+(model/endpoint/empty-response guard), while a failed gate after real edits needs
+a better *brief*. Counting them together hides both.
+
+Three properties the split is built to keep honest:
+
+- **pre-existing dirt is not work.** The comparison is digest-to-digest, so a
+  file the owner had already edited (tracked or untracked) never reads as
+  `partial_work` — a mere "the tree is dirty" check would.
+- **`abstained` is only claimed when it is measurable.** A workspace that is not
+  a git work tree, or had no HEAD at run start, yields `work_evidence.measurable
+  = false` and therefore `partial_work`: "we cannot see" is never reported as
+  "nothing happened".
+- **the gate cannot flatter itself.** The finish fingerprint is taken *before*
+  the gate runs, so a gate that executes a test suite (and thereby creates
+  `__pycache__`) cannot turn a genuine stall into `partial_work`.
+
+`work_evidence` ships alongside the label — `{commits, tracked_changed,
+dirt_changed, new_dirt, measurable}` — so a verdict can be audited, not just
+trusted. Unknown/future statuses fall back to `partial_work`, the conservative
+side of the split: never silently shrink the failure count.
 
 Two knobs keep evidence out of the way of tests and CI (both default to sane
 places): `TEAMKIT_RUNS_DIR` relocates the record tree (default `<repo>/runs`,

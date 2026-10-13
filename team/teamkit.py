@@ -11,7 +11,8 @@ Usage (taskmaster side):
     # result: {status, calls, cache_hit_pct, verdict:{pass:[],fail:[]}, files_changed:[], tail}
 Never parses human prose for verdicts: gate command exit code + git diff are the truth.
 
-Three runner disciplines (R1, ported from Gen-Verse/RSI-Anything hygiene ideas):
+Four runner disciplines (R1 + R2, ported from Gen-Verse/RSI-Anything hygiene
+ideas):
   D1 RunRecord  every run persists runs/<utc>-<slug>/{config,state,summary}.json,
                 guarded by one O_EXCL lock per run slug (FileLockError, pre-spend).
   D2 Gate v2    contract['incumbent_gate'] turns the single gate into a component
@@ -146,6 +147,7 @@ class _Ctx:
         self.run_dir = None
         self.baseline_ref = None
         self.baseline = None
+        self.workcheck = None
         self.pair = None
         self.stages = {s: {'status': 'pending', 'attempts': 0} for s in STAGES}
 
@@ -170,7 +172,7 @@ def _rec():
 def _reset_rec(rec):
     """Clear a context so a finished (or refused) run leaves no stale state."""
     rec.recorder = rec.lock_path = rec.run_dir = rec.baseline_ref = None
-    rec.baseline = rec.pair = None
+    rec.baseline = rec.workcheck = rec.pair = None
     rec.stages = {s: {'status': 'pending', 'attempts': 0} for s in STAGES}
 
 
@@ -610,23 +612,23 @@ def capture_workspace_state(workspace):
 def work_evidence(base, after=None):
     """What the run actually produced, between two fingerprints.
 
-    {'commits': int|None, 'tracked_changed': bool, 'new_dirt': [porcelain lines],
-     'measurable': bool}. commits is None (and measurable False) when the
-    workspace is not a git tree or had no HEAD at run start: 'we cannot see'
-    must never be reported as 'the team did nothing'.
+    {'commits': int|None, 'tracked_changed': bool, 'dirt_changed': bool,
+     'new_dirt': [porcelain lines], 'measurable': bool}. commits is None (and
+    measurable False) when the workspace is not a git tree or had no HEAD at
+    run start: 'we cannot see' must never be reported as 'the team did nothing'.
     """
     base = base or {}
     after = after if after is not None else capture_workspace_state(
         base.get('root') or '.')
-    commits = _commits_since(base, after)
     known = set((base.get('porcelain') or '').splitlines())
-    new_dirt = [l for l in (after.get('porcelain') or '').splitlines()
-                if l and l not in known]
-    return {'commits': commits,
+    return {'commits': _commits_since(base, after),
             'tracked_changed': (base.get('tracked_sha') or '') !=
                                (after.get('tracked_sha') or ''),
-            'new_dirt': new_dirt,
-            'measurable': commits is not None}
+            'dirt_changed': (base.get('porcelain_sha') or '') !=
+                            (after.get('porcelain_sha') or ''),
+            'new_dirt': [l for l in (after.get('porcelain') or '').splitlines()
+                         if l and l not in known],
+            'measurable': _commits_since(base, after) is not None}
 
 
 def _commits_since(base, after):
@@ -646,25 +648,30 @@ def _commits_since(base, after):
         return None
 
 
+def _has_work(ev):
+    """Evidence says the run left something behind."""
+    if not ev or not ev.get('measurable'):
+        return True            # cannot prove zero work -> never claim abstention
+    return bool(ev.get('commits')) or ev.get('tracked_changed') or \
+        ev.get('dirt_changed')
+
+
 def produce_work(base, after=None):
     """True when the run left evidence: new commits, a changed tracked diff, or
     dirt that was not present at run start."""
-    ev = work_evidence(base, after)
-    if not ev['measurable']:
-        return True            # cannot prove zero work -> never claim abstention
-    return (ev['commits'] > 0 or ev['tracked_changed'] or bool(ev['new_dirt']))
+    return _has_work(work_evidence(base, after))
 
 
-def classify_outcome(status, base=None, after=None):
+def classify_outcome(status, base=None, after=None, ev=None):
     """One of OUTCOMES for a finished (or refused, or crashed) run.
 
-    base/after are capture_workspace_state() dicts; `after` defaults to a fresh
-    capture of base's root, so a caller that has the run-start fingerprint only
-    needs the status. GATE_PASS / GATE_PASS_NEW -> success; GATE_PASS_TIE ->
-    tie_kept (retained, not proven better); BUDGET_REFUSED / DRY_PLAN ->
-    refused (zero spend, kept out of failure stats); GATE_FAIL /
-    RUN_DONE_NO_GATE / ERROR -> partial_work when there is work evidence,
-    abstained when the run touched nothing. Never raises.
+    base/after are capture_workspace_state() dicts and `ev` is a precomputed
+    work_evidence(); `after` defaults to a fresh capture of base's root.
+    GATE_PASS / GATE_PASS_NEW -> success; GATE_PASS_TIE -> tie_kept (retained,
+    not proven better); BUDGET_REFUSED / DRY_PLAN -> refused (zero spend, kept
+    out of failure stats); GATE_FAIL / RUN_DONE_NO_GATE / ERROR -> partial_work
+    when there is work evidence, abstained when the run touched nothing.
+    Never raises; an unlisted status is treated as a failure, not a stall.
     """
     try:
         if status in _OUTCOME_SUCCESS:
@@ -674,26 +681,52 @@ def classify_outcome(status, base=None, after=None):
         if status in _OUTCOME_REFUSED:
             return 'refused'
         if status in _OUTCOME_WORKED:
-            return 'partial_work' if produce_work(base, after) else 'abstained'
+            ev = ev if ev is not None else work_evidence(base, after)
+            return 'partial_work' if _has_work(ev) else 'abstained'
         return 'partial_work'
     except Exception:
         return 'partial_work'
 
 
 def _spend_started(rec):
-    """Did this run reach the point where conv.run() could spend? (D4: an ERROR
-    raised before that is a refusal — zero spend — not a failure of the team.)"""
+    """Did this run reach the `team_run` stage, where conv.run() can spend?
+
+    D4: an ERROR raised earlier — preflight, lane check, agent registration —
+    spent zero calls, so it is a refusal, not a failure of the team.
+    """
     try:
         return int(rec.stages.get('team_run', {}).get('attempts', 0)) > 0
     except Exception:
         return True
 
 
-def _outcome_for(rec, status):
-    """classify_outcome() wired to this thread's run-start fingerprint."""
+def _outcome_for(rec, status, ev=None):
+    """classify_outcome() wired to this run's run-start fingerprint."""
     if status == 'ERROR' and not _spend_started(rec):
         return 'refused'
-    return classify_outcome(status, getattr(rec, 'baseline', None))
+    return classify_outcome(status, getattr(rec, 'baseline', None), ev=ev)
+
+
+def _work_evidence_for(rec):
+    """Evidence between run start and the moment the team finished.
+
+    Taken BEFORE the gate on purpose (see _capture_workcheck): a gate that runs
+    a test suite creates __pycache__/.pytest_cache dirt of its own, which must
+    not be mistaken for work the team produced — that would relabel a stall as
+    partial_work, the exact statistic this split exists to keep clean.
+    """
+    try:
+        return work_evidence(rec.baseline, getattr(rec, 'workcheck', None))
+    except Exception:
+        return None
+
+
+def _capture_workcheck(rec, workspace):
+    """Fingerprint the workspace the instant the team stops (or crashes)."""
+    try:
+        rec.workcheck = capture_workspace_state(os.path.abspath(workspace or '.'))
+    except Exception:
+        rec.workcheck = None
 
 
 def _emit_plan(run_dir, plan):
@@ -713,7 +746,8 @@ def run_team(brief=None, spec=None, workspace='.', budget_calls=80, contract=Non
     Pre-existing behaviour is unchanged; wrapped around it: D3 chokepoints first
     (BUDGET_REFUSED / DRY_PLAN, both before preflight), then the per-slug lock,
     then the run itself under stage recording. Returns the legacy keys plus
-    `run_dir` and `pair`. `on_run` is a test seam, called where conv.run() edits.
+    `run_dir`, `pair`, `outcome` and `work_evidence` (D4). `on_run` is a test
+    seam, called where conv.run() edits.
     """
     # ---- D3 chokepoint: refuse / plan BEFORE preflight, before any spend.
     try:
@@ -785,23 +819,25 @@ def run_team(brief=None, spec=None, workspace='.', budget_calls=80, contract=Non
                                  waive_lessons, max_empty_responses, on_run=on_run)
         rec.pair = result.get('pair')
         # D4: outcome computed AFTER gating, from the run-start fingerprint vs
-        # the git state now. Existing keys keep their meaning; only outcome and
-        # work_evidence are added.
-        result['outcome'] = _outcome_for(rec, result.get('status'))
-        result['work_evidence'] = work_evidence(rec.baseline)
+        # the state captured when the team stopped. Existing keys keep their
+        # meaning; only outcome and work_evidence are added.
+        ev = _work_evidence_for(rec)
+        result['outcome'] = _outcome_for(rec, result.get('status'), ev)
+        result['work_evidence'] = ev
         # existing keys stay byte-compatible; ONLY run_dir is added (None if the
         # recording itself failed)
         result['run_dir'] = write_record(rec, result)
         return result
     except Exception as exc:
         status = 'ERROR'
+        ev = _work_evidence_for(rec)
         write_record(rec, {"status": status,
                            "error": f'{type(exc).__name__}: {str(exc)[-300:]}',
                            "gate": None, "gate_tail": "", "lessons": None,
                            "workdir_diff": "", "recent_commits": "",
                            "orchestrator_final": "", "pair": None,
-                           "outcome": _outcome_for(rec, status),
-                           "work_evidence": work_evidence(rec.baseline)})
+                           "outcome": _outcome_for(rec, status, ev),
+                           "work_evidence": ev})
         raise
     finally:
         release_run_lock(rec)
@@ -905,8 +941,10 @@ def _run_team_inner(rec, brief, spec, workspace, budget_calls, contract, model,
             on_run(workspace)
         conv.run()
     except Exception as exc:
+        _capture_workcheck(rec, workspace)
         stage_end(rec, 'team_run', 'fail', exc)
         raise
+    _capture_workcheck(rec, workspace)
     stage_end(rec, 'team_run', 'done')
 
     # deterministic grading: component check (+ pair check vs incumbent) and git
