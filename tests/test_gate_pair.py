@@ -164,7 +164,9 @@ def test_pair_sub_dict_shape_is_exact(monkeypatch, repo):
 def test_summary_json_records_the_pair_verdict(monkeypatch, repo):
     res = do_run(monkeypatch, repo, {"gate": "true", "incumbent_gate": "false"})
     summary = json.loads((Path(res["run_dir"]) / "summary.json").read_text())
-    assert summary == res
+    # R4b-D6: the record additionally carries `recall`; everything else is
+    # exactly the returned dict.
+    assert {k: v for k, v in summary.items() if k != "recall"} == res
     assert summary["pair"]["g_base"]["ok"] is False
 
 

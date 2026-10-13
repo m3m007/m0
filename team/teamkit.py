@@ -28,7 +28,13 @@ ideas):
                 not counted as gate failures. See README.
 Stdlib only, and openhands stays a lazy import so unit tests run on bare python3.
 """
-import hashlib, json, os, re, shutil, subprocess, sys, tempfile, time
+import hashlib, json, logging, os, re, shutil, subprocess, sys, tempfile, time
+
+#: R4b-D7: the RC2 guard used to be an assert inside preflight(). Loud does not
+#: mean fatal: a poisoned `model:` line is repaired in memory and reported here,
+#: so the run keeps going with the inherited lane. logger.warning over print:
+#: pytest's caplog and any host handler both see it, a bare stdout line does not.
+log = logging.getLogger('teamkit')
 
 CFG = '/home/hermes/.hermes/config.yaml'
 TP_ANTH = 'https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic'
@@ -164,25 +170,207 @@ def _key():
     return m.group(1).strip().strip("'").strip('"')
 
 
-def preflight():
-    """Skill rule: verify role defs parse with registered tools BEFORE spending calls."""
-    os.environ['OPENHANDS_SUPPRESS_BANNER'] = '1'
-    from pathlib import Path
-    from openhands.sdk.subagent import load_agents_from_dir
+def _known_tool_names():
+    """Flat set of tool names the SDK preset actually registers."""
     from openhands.tools.preset.default import get_default_tools
     flat = set()
     for ts in get_default_tools(enable_browser=False, enable_sub_agents=True):
         for t in getattr(ts, 'tools', [ts]):
             flat.add(getattr(t, 'name', str(t)))
+    return flat
+
+
+def _normalize_model(d):
+    """R4b-D7: the RC2 guard, self-healing. (name, original) or (None, None).
+
+    A `model:` value that is not ''/inherit is an LLM *profile name* to the SDK
+    (registry.agent_definition_to_factory -> LLMProfileStore.load), and a profile
+    that does not exist raises inside every Task call — mid-run, after spend. The
+    file stays on disk exactly as its author left it; the in-memory definition
+    used by THIS run becomes 'inherit', and the warning names file + value so the
+    owner can fix the source. Returns (name, original) when something was
+    normalized so the caller can record it.
+    """
+    m = getattr(d, 'model', None)
+    if isinstance(m, str) and m.strip() not in ('', 'inherit'):
+        source = getattr(d, 'source', None) or '<no source recorded>'
+        log.warning("TDAI/RC2 normalize: role '%s' file %s sets model '%s' "
+                    "(an LLM profile name the SDK would look up and crash on); "
+                    "using 'inherit' for this run. Fix the file to persist a "
+                    "profile.", d.name, source, m)
+        try:
+            d.model = 'inherit'
+        except Exception:
+            try:                # frozen/pydantic-strict models: copy instead
+                object.__setattr__(d, 'model', 'inherit')
+            except Exception:
+                return d.name, m
+        return d.name, m
+    return None, None
+
+
+def workspace_agent_dirs(workspace):
+    """The SDK's own project-level agent dirs, resolved against `workspace`.
+
+    `_FILE_BASED_AGENTS_DIR` in openhands/sdk/subagent/load.py is literally
+    ['.agents/agents', '.openhands/agents'], relative to the conversation's
+    working dir — so these two paths are exactly what LocalConversation would
+    auto-register on the first send_message(). Keeping the list in one place is
+    what lets builder mode and orchestrator mode share one refresh.
+    """
+    from pathlib import Path
+    ws = Path(os.path.abspath(str(workspace)))
+    return [ws / '.agents' / 'agents', ws / '.openhands' / 'agents']
+
+
+def _clamp_cap(d, cap):
+    """R4b-D7b: effective per-role iteration cap, def value bounded by the run.
+
+    Returns the value the definition now carries: min(def, cap) when both exist
+    (def wins lower, the budget clamps a permissive frontmatter), the cap alone
+    when the file states none, and the def alone when `cap` is None.
+    """
+    declared = getattr(d, 'max_iteration_per_run', None)
+    if isinstance(cap, int) and cap > 0:
+        eff = min(int(declared), cap) if isinstance(declared, int) else cap
+    else:
+        eff = declared
+    try:
+        d.max_iteration_per_run = eff
+    except Exception:
+        try:
+            object.__setattr__(d, 'max_iteration_per_run', eff)
+        except Exception:
+            pass
+    return eff
+
+
+def refresh_workspace_agents(workspace, defs=None, cap=None):
+    """R4b-D7: force the registry to hold CURRENT disk definitions (both modes).
+
+    Why this is not the SDK's job — three facts, each verified offline against
+    openhands-sdk 1.54 (tests/test_r4b_d7_agents.py, probe finding recorded
+    there):
+      1. LocalConversation DOES auto-register {working_dir}/.agents/agents and
+         {working_dir}/.openhands/agents at the first send_message()/run(), and
+         LocalWorkspace keeps `working_dir` verbatim (no resolve, no normalise),
+         so a relative workspace points the SDK somewhere else entirely.
+      2. It registers with `register_agent_if_absent`: an entry from an earlier
+         run in the same process is kept, so the second run silently executes
+         the FIRST run's file contents. Stale drift.
+      3. The lazy pass never re-reads a file it has already registered.
+    So teamkit pops the name and re-registers from the file it just parsed: the
+    registry after this call is exactly what is on disk right now.
+
+    `cap` (R4b-D7b) clamps each definition's `max_iteration_per_run` in memory.
+    The SDK spawns sub-agent conversations with
+    `factory.definition.max_iteration_per_run or parent.max_iteration_per_run`
+    (openhands/tools/task/manager.py::_create_task), so clamping the definition
+    IS what bounds the role's Conversation, and `permission_mode` reaches that
+    child through the same definition (get_confirmation_policy()). A permissive
+    frontmatter value can therefore never outrun the run budget.
+
+    Returns ({'names': [...], 'normalized': [{'name','model'}],
+             'caps': {name: effective_cap}, 'defs': [...]}, warnings).
+    `defs` is what the orchestrator registration loop consumes. Never raises:
+    an unloadable file is already a loud SDK warning, and a refresh failure must
+    not abort a run that has not spent anything yet.
+    """
+    from pathlib import Path
+    from openhands.sdk.subagent import (agent_definition_to_factory,
+                                        load_agents_from_dir,
+                                        register_agent_if_absent)
+    from openhands.sdk.subagent.registry import _agent_factories, _registry_lock
+
+    os.environ['OPENHANDS_SUPPRESS_BANNER'] = '1'
+    if defs is None:
+        defs = []
+        for agents_dir in workspace_agent_dirs(workspace):
+            try:
+                defs.extend(load_agents_from_dir(Path(agents_dir)))
+            except Exception as exc:
+                log.warning("agent dir %s failed to load: %s: %s", agents_dir,
+                            type(exc).__name__, str(exc)[-200:])
+    registered, normalized, caps, warnings = [], [], {}, []
+    seen, unique = set(), []
+    for d in defs or []:
+        if d.name in seen:
+            continue        # first dir wins, mirroring the SDK's dedup order
+        seen.add(d.name)
+        unique.append(d)
+    defs = unique
+    for d in defs:
+        try:
+            nm, original = _normalize_model(d)
+            if nm:
+                normalized.append({'name': nm, 'model': original})
+                warnings.append(f"model normalized: {nm} -> inherit "
+                                f"(was '{original}')")
+            caps[d.name] = _clamp_cap(d, cap)
+            with _registry_lock:
+                # force-refresh: drop any stale registration from a previous run
+                # in this process so the CURRENT md file is what executes
+                _agent_factories.pop(d.name, None)
+            # The DEFINITION object is passed as the description, not a string:
+            # register_agent_if_absent -> _resolve_agent_definition turns a plain
+            # string into a metadata-empty AgentDefinition, and the Task manager
+            # reads `factory.definition.max_iteration_per_run` +
+            # `get_confirmation_policy()` off exactly that object. A string here
+            # is how a role's cap and permission_mode silently stop existing.
+            register_agent_if_absent(d.name,
+                                     agent_definition_to_factory(d, workspace),
+                                     d)
+            registered.append(d.name)
+        except Exception as exc:
+            log.warning("agent '%s' could not be registered: %s: %s",
+                        getattr(d, 'name', '?'), type(exc).__name__,
+                        str(exc)[-200:])
+            warnings.append(f"register failed: {getattr(d, 'name', '?')}: "
+                            f"{type(exc).__name__}")
+    return ({'names': registered, 'normalized': normalized, 'caps': caps,
+             'defs': defs or []}, warnings)
+
+
+def _workspace_defs(workspace):
+    """Parse (never register) the workspace's own file agents.
+
+    refresh_workspace_agents() consumes these alongside the AGENTS_DIR roles so
+    one call owns every registry mutation; failures degrade to "no extra defs"
+    the same way the refresh's own scan does.
+    """
+    from pathlib import Path
+    try:
+        from openhands.sdk.subagent import load_agents_from_dir
+    except Exception:
+        return []
+    out = []
+    for agents_dir in workspace_agent_dirs(workspace):
+        try:
+            out.extend(load_agents_from_dir(Path(agents_dir)))
+        except Exception as exc:
+            log.warning("agent dir %s failed to load: %s: %s", agents_dir,
+                        type(exc).__name__, str(exc)[-200:])
+    return out
+
+
+def preflight():
+    """Skill rule: verify role defs parse with registered tools BEFORE spending calls.
+
+    R4b-D7: the RC2 `model:` check is no longer an assert here — it is
+    _normalize_model(), which repairs the in-memory definition and warns loudly.
+    A typo in one role file is a repairable defect, not a reason to refuse the
+    whole run at zero spend.
+    """
+    from pathlib import Path
+    from openhands.sdk.subagent import load_agents_from_dir
+    flat = _known_tool_names()
     defs = load_agents_from_dir(Path(AGENTS_DIR))
     for d in defs:
         tl = list(d.tools)
         assert tl, f"PREFLIGHT FAIL {d.name}: zero tools (frontmatter?)"
         miss = [x for x in tl if x not in flat]
         assert not miss, f"PREFLIGHT FAIL {d.name}: unregistered {miss}"
-        m = getattr(d, 'model', None)
-        if isinstance(m, str):
-            assert m.strip() in ('', 'inherit'), f"PREFLIGHT FAIL {d.name}: model '{m}' is treated as an LLM profile name and will crash every Task call (use 'inherit')"
+        _normalize_model(d)
     return defs
 
 
@@ -360,6 +548,9 @@ class RunRecorder:
 
     def __init__(self, run_dir):
         self.run_dir = run_dir
+        #: R4b-D6: the recall projection the summary must carry, set by run_team()
+        #: from the private `_recall_info` carrier before it writes the record.
+        self.recall = None
 
     def write_json(self, name, obj):
         tmp = os.path.join(self.run_dir, name + '.tmp')
@@ -376,6 +567,11 @@ class RunRecorder:
     def summary(self, result):
         d = dict(result)
         d['run_dir'] = self.run_dir
+        # D6: summary.json carries the same recall attribution config.json does.
+        # Added to the RECORD, never to the returned dict, so callers that assert
+        # the documented key set keep seeing exactly that set.
+        if self.recall:
+            d['recall'] = self.recall
         self.write_json('summary.json', d)
         return d
 
@@ -387,6 +583,20 @@ def record_config(rec, cfg):
     """config.json — never raises: a broken recorder must not crash a run."""
     try:
         rec.recorder.config(cfg)
+    except Exception:
+        pass
+
+
+def record_recall(rec, recall_info):
+    """R4b-D6: hand the recorder this run's recall attribution.
+
+    config.json gets it as part of _record_config(); summary.json is written from
+    run_team()'s result dict, which must keep its documented key set, so the
+    projection rides on the recorder instead. Set once, as soon as the hub read
+    has happened, so even a run that later raises carries its attribution.
+    """
+    try:
+        rec.recorder.recall = _recall_summary(recall_info)
     except Exception:
         pass
 
@@ -920,25 +1130,55 @@ def _m0(model):
     return str(model or '').startswith('openai/')
 
 
+def _recall_summary(recall):
+    """R4b-D6: the config.json `recall` key, from a _recall_info() dict.
+
+    {recall_status: fired|empty|unavailable|error, hits: [{name|sha8, chars}]}.
+    `unavailable` (no key / no bridge) is recorded explicitly rather than being
+    absent: "memory said nothing" and "memory was never reachable" have to stay
+    distinguishable in the record, which is the entire point of the status.
+    Keys of the info dict are the contract (RECALL_STATUSES), so this is a
+    projection, not a re-derivation.
+    """
+    if not recall:
+        return None
+    return {'recall_status': recall.get('recall_status'),
+            'hits': [{'name': h['name'], 'chars': h.get('chars', 0)}
+                     if 'name' in h else
+                     {'sha8': h.get('sha8', ''), 'chars': h.get('chars', 0)}
+                     for h in recall.get('recall_hits') or []]}
+
+
 def _record_config(ws, model, base_url, budget_calls, contract, roles, brief,
-                   spec, run_dir=None, recall=None):
+                   spec, run_dir=None, recall=None, agents=None,
+                   task_start_ts=None):
     """config.json payload: resolved inputs + sha256 of the brief text (never
     the text itself) + the contract verbatim + R4-D4 recall attribution.
 
-    `recall` is the _recall_info() dict. Only the two honest keys are kept:
-    recall_status (fired|empty|unavailable|error) and recall_hits, which holds
-    lesson NAMES/HASHES and their sizes, never lesson content.
+    `recall` is the _recall_info() dict. Flat `recall_status`/`recall_hits` are
+    kept for every reader that landed before R4b; R4b-D6 adds the nested
+    `recall` summary, which is the shape the acceptance contract names.
+    `agents` is R4b-D7's registration summary (registered names, normalized
+    model values, per-role caps, agent warnings); recorded only when a refresh
+    actually ran. `task_start_ts` (R4b-D8) is the value exported to
+    $TASK_START_TS for every child process, so the record and the tester's
+    ledger window can be reconciled.
     """
     msg_text = (brief if brief else spec) or ''
     cfg = {"run_dir": run_dir, "workspace": ws, "model": model,
            "base_url": base_url, "budget_calls": budget_calls,
            "contract": contract, "roles": roles,
            "brief_sha256": sha256_text(msg_text)}
+    if task_start_ts is not None:
+        cfg['task_start_ts'] = task_start_ts
     if recall:
         cfg['recall_status'] = recall.get('recall_status')
         cfg['recall_hits'] = recall.get('recall_hits') or []
+        cfg['recall'] = _recall_summary(recall)
         if recall.get('recall_error'):
             cfg['recall_error'] = recall['recall_error']
+    if agents:
+        cfg['agents'] = agents
     return cfg
 
 
@@ -955,11 +1195,49 @@ def _run_team_inner(rec, brief, spec, workspace, budget_calls, contract, model,
     """
     stage_start(rec, 'preflight')
     try:
-        defs = [] if roles == 'none' else preflight()
+        # R4b-D8: team/roles/tester.md reads $TASK_START_TS to bound its ledger
+        # delta to THIS run; nothing set it, so the window was always "the whole
+        # session". Exported before any subprocess exists (gate, agent terminal,
+        # the tester one-liner) and recorded so the record says what the children
+        # were given.
+        task_start_ts = int(time.time())
+        os.environ['TASK_START_TS'] = str(task_start_ts)
+        # R4b-D7b: the run budget bounds whatever a role file declares.
+        iter_cap = max(1, int(budget_calls) * 3)
+        # R4b-D7a: BOTH modes force-refresh. Orchestrator mode starts from the
+        # AGENTS_DIR roles preflight() parsed and adds this workspace's own file
+        # agents; builder mode starts from the workspace files alone (it has no
+        # AGENTS_DIR roles, since nothing delegates). refresh_workspace_agents
+        # pops each name out of `_agent_factories` and re-registers it from the
+        # CURRENT disk file, which is the only way an already-registered name
+        # picks up an edit (the SDK uses register_agent_if_absent: absent-only).
+        # `defs` below stays the AGENTS_DIR list so the orchestrator's
+        # registration loop and the general-purpose alias behave exactly before.
+        if roles == 'none':
+            defs = []
+            refresh, agent_warns = refresh_workspace_agents(workspace,
+                                                            cap=iter_cap)
+        else:
+            defs = preflight()
+            refresh, agent_warns = refresh_workspace_agents(
+                workspace, defs=list(defs) + _workspace_defs(workspace),
+                cap=iter_cap)
+        agents_summary = {"registered": refresh['names'],
+                          "normalized": refresh['normalized'],
+                          "caps": refresh['caps'],
+                          "builder_mode": roles == 'none',
+                          "iter_cap": iter_cap}
+        if agent_warns:
+            agents_summary["warnings"] = agent_warns
     except Exception as exc:
         stage_end(rec, 'preflight', 'fail', exc)
         raise
     stage_end(rec, 'preflight', 'done')
+    # `defs` deliberately stays the AGENTS_DIR list: refresh_workspace_agents()
+    # has already registered those (normalized, cap-clamped) objects plus the
+    # workspace's own file agents, and the loop below repeats the AGENTS_DIR
+    # registration exactly as it did before, so the orchestrator's alias handling
+    # and the run's recorded `agents` summary describe the same set of names.
     from openhands.sdk import LLM, Agent, Conversation
     from openhands.tools.preset.default import get_default_tools
     from openhands.sdk.security.confirmation_policy import NeverConfirm
@@ -972,17 +1250,32 @@ def _run_team_inner(rec, brief, spec, workspace, budget_calls, contract, model,
     # the record and the PRIOR LEARNINGS block appended to the message below.
     recall_info = _recall_info(_tdai(), os.path.basename(str(workspace).rstrip('/'))
                                + ' ' + (brief or spec or '')[:400])
+    record_recall(rec, recall_info)      # so summary.json carries it too (D6)
     record_config(rec, _record_config(os.path.abspath(workspace or '.'), model,
                                       base_url, budget_calls, contract, roles,
-                                      brief, spec, rec.run_dir, recall=recall_info))
+                                      brief, spec, rec.run_dir,
+                                      recall=recall_info, agents=agents_summary,
+                                      task_start_ts=task_start_ts))
     llm = LLM(model=model, api_key=_key(), base_url=base_url)
+    # NOTE (R4b-D7): the registration below is NOT the force-refresh. That
+    # already happened inside refresh_workspace_agents() at the top of this
+    # function, for BOTH modes, with the model normalization and the cap clamp
+    # applied to the in-memory definitions. What remains here keeps the
+    # orchestrator's explicit registration contract for the AGENTS_DIR roles
+    # (pop + register + the general-purpose alias) using those same refreshed
+    # definition objects, so the registry can never hold a pre-normalization or
+    # pre-clamp copy of a role.
     from openhands.sdk.subagent.registry import _agent_factories, _registry_lock
     for d in defs:
         # force-refresh: drop any stale registration from a previous run so the
         # CURRENT md file on disk is what actually executes (silent-drift trap)
         with _registry_lock:
             _agent_factories.pop(d.name, None)
-        register_agent_if_absent(d.name, agent_definition_to_factory(d, workspace), d.description or d.name)
+        # description is the DEFINITION object, never a bare string: a string
+        # becomes a metadata-empty AgentDefinition inside the SDK, and that is
+        # where the Task manager reads max_iteration_per_run and
+        # permission_mode from (R4b-D7b).
+        register_agent_if_absent(d.name, agent_definition_to_factory(d, workspace), d)
     # Task tool defaults subagent_type='general-purpose'; without it registered,
     # any such call dies with 'Unknown agent'. Map it to fixer as a safe alias.
     if 'general-purpose' not in _agent_factories and 'fixer' in _agent_factories:
@@ -1009,7 +1302,11 @@ def _run_team_inner(rec, brief, spec, workspace, budget_calls, contract, model,
         )
         tools = get_default_tools(enable_browser=False, enable_sub_agents=True)
     agent = Agent(llm=llm, tools=tools, system_prompt=sys_prompt)
-    conv = Conversation(agent=agent, workspace=workspace, max_iteration_per_run=budget_calls * 3,
+    # R4b-D7b: `iter_cap` is exactly the old budget_calls * 3, hoisted into the
+    # preflight block because the same number must bound every per-role
+    # definition cap; min(def, iter_cap) lands on the definition objects above
+    # and this Conversation is the parent they inherit from.
+    conv = Conversation(agent=agent, workspace=workspace, max_iteration_per_run=iter_cap,
                         stuck_detection_thresholds={"action_observation": 6, "action_error": 6,
                                                     "monologue": 8, "alternating_pattern": 6})
     if roles == 'none':

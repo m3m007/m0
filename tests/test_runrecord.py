@@ -177,7 +177,11 @@ def test_every_run_persists_config_state_summary(tmp_path, monkeypatch,
     assert all(st[s]["attempts"] == 1 for s in tk.STAGES), st
 
     summary = json.loads((run_dir / "summary.json").read_text())
-    assert summary == result, "summary.json is exactly the returned dict + run_dir"
+    # R4b-D6: summary.json is the returned dict + run_dir + the recall
+    # attribution (the record carries what memory contributed; the returned dict
+    # keeps its documented key set).
+    assert summary == {**result, "run_dir": str(run_dir),
+                       "recall": cfg.get("recall")}, "summary.json content"
     assert summary["run_dir"] == str(run_dir)
 
 

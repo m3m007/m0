@@ -331,7 +331,9 @@ def test_outcome_is_written_into_summary_json_on_every_path(repo, plain,
         s = summary(res)
         assert s["outcome"] == res["outcome"]
         assert s["work_evidence"] == res["work_evidence"]
-        assert s == res, "summary.json stays exactly the returned dict + run_dir"
+        # R4b-D6: the record carries `recall` on top of the returned dict.
+        assert {k: v for k, v in s.items() if k != "recall"} == res, \
+            "summary.json is the returned dict + run_dir + recall"
 
 
 def test_outcome_survives_a_broken_recorder(repo, monkeypatch):
