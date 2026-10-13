@@ -34,7 +34,17 @@ CFG = '/home/hermes/.hermes/config.yaml'
 TP_ANTH = 'https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic'
 TP_COMPAT = 'https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1'
 AGENTS_DIR = '/home/hermes/.hermes/cache/scratch/oh_team2/agents'
-TDAI_BRIDGE = '/home/hermes/.hermes/scripts/tdai-bridge.py'
+# R4 import-path decision: teamkit loads the REPO copy below, so the code that
+# writes shared memory travels with the history that explains it. The executor-
+# readable twin at /home/hermes/.hermes/scripts/tdai-bridge.py is kept
+# byte-identical (`diff` clean) for anything that runs outside this repo.
+TDAI_BRIDGE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           'tdai-bridge.py')
+TDAI_BRIDGE_EXECUTOR = '/home/hermes/.hermes/scripts/tdai-bridge.py'
+#: R4-D3: only these outcomes may auto-seed lessons into the shared hub.
+SEEDABLE_OUTCOMES = ('success', 'tie_kept')
+#: R4-D4: the only recall_status values, so four outcomes stay distinguishable.
+RECALL_STATUSES = ('fired', 'empty', 'unavailable', 'error')
 
 # Model-lane policy (mechanical preflight, owner rule 2026-10-11):
 # anthropic-prefix flash/ds models die in-loop with empty tool-less responses
@@ -56,7 +66,12 @@ def _lane_check(model, base_url):
 
 def _tdai():
     """Optional TDAI memory-hub bridge (read/write paths). No key -> None:
-    runs proceed exactly as before (zero regression). Never raises."""
+    runs proceed exactly as before (zero regression). Never raises.
+
+    R4-D4: a bridge that loaded but whose hub call threw is NOT this function's
+    business — it returns the module, and recall_detail()'s status carries the
+    difference between "no memory" and "memory unreachable".
+    """
     try:
         import importlib.util
         spec = importlib.util.spec_from_file_location('tdai_bridge', TDAI_BRIDGE)
@@ -69,24 +84,78 @@ def _tdai():
         return None
 
 
-def _recall_block(query):
-    tb = _tdai()
+def _recall_info(tb, query):
+    """R4-D4: run the read path ONCE and describe the result, four ways.
+
+    -> {'recall_status': fired|empty|unavailable|error,
+        'recall_hits': [{'name'|'sha8', 'chars'}],
+        'hits': [content strings for the message]}
+    `recall_hits` is names/hashes and sizes only, never content, so it is safe
+    to put in config.json. A hub that answered with an error dict used to no-op
+    into the same silence as a hub with nothing to say; that conflation is
+    exactly what this returns a label for.
+    """
     if not tb:
-        return ''
-    hits = tb.recall(query)
-    if not hits:
-        return ''
-    return ("\n\nPRIOR LEARNINGS (shared team memory; treat as hints, verify against repo):\n"
-            + "\n---\n".join(hits)) + "\n"
+        return {'recall_status': 'unavailable', 'recall_hits': [], 'hits': []}
+    try:
+        d = tb.recall_detail(query)
+    except Exception as exc:
+        return {'recall_status': 'error', 'recall_hits': [], 'hits': [],
+                'recall_error': f'{type(exc).__name__}: {str(exc)[-200:]}'}
+    hits = [{'name': h['name'], 'chars': h['chars']} if 'name' in h
+            else {'sha8': h.get('sha8', ''), 'chars': h.get('chars', 0)}
+            for h in d.get('meta') or []]
+    status = d.get('status') or 'empty'
+    if status == 'fired' and not (d.get('hits') or []):
+        status = 'empty'   # `fired` with nothing to show is a contradiction
+    if status not in RECALL_STATUSES:
+        # An unlabelled answer is not a documented one: report it as `error`
+        # rather than letting it masquerade as the `empty` it is not.
+        status = 'error'
+    return {'recall_status': status,
+            'recall_hits': hits, 'hits': d.get('hits') or [],
+            'recall_error': (d.get('error') or '')[:200] or None}
+
+
+def _recall_block(query, info=None):
+    """The PRIOR LEARNINGS text appended to the brief, plus its attribution.
+
+    Returns (text, info): the text lands in the message AFTER brief hashing, so
+    config.json can only know what memory contributed if the caller records the
+    info dict (R4-D4). `info` may be passed in so a caller that already ran the
+    read path does not call the hub twice.
+    """
+    info = info if info is not None else _recall_info(_tdai(), query)
+    hits = info.get('hits') or []
+    if info.get('recall_status') != 'fired' or not hits:
+        return '', info   # the block only ever lands on a real, fired recall
+    return ("\n\nPRIOR LEARNINGS (shared team memory; treat as hints, "
+            "verify against repo):\n" + "\n---\n".join(hits)) + "\n", info
 
 
 def learn_out(workspace, notes):
-    """Post-run distillation into the shared hub. notes: list[str] of durable lessons."""
+    """Post-run distillation into the shared hub. notes: list[str] of durable lessons.
+
+    R4-D1: names come from lesson CONTENT (`lesson-<ws-slug>-<sha8>`), not a
+    slot index, so every note in a run is a distinct record and a re-run of the
+    same lesson is the hub's duplicate rejection rather than a silent no-op.
+    R4-D4: returns seeded/duplicates/errors/of so the caller can mark a partly
+    landed batch `partial` instead of `done`.
+    """
     tb = _tdai()
     if not tb:
-        return {'tdai': 'unavailable'}
-    ok = [tb.seed_skill(f'teamkit-lesson-{i}', n) for i, n in enumerate(notes)]
-    return {'tdai_seeded': sum(bool(x) for x in ok), 'of': len(notes)}
+        return {'tdai': 'unavailable', 'seeded': 0, 'duplicates': 0,
+                'errors': 0, 'of': len(notes or [])}
+    if hasattr(tb, 'seed_lessons'):
+        return tb.seed_lessons(workspace, notes)
+    names, seeded = [], 0
+    for n in notes or []:
+        nm = (tb.lesson_name(workspace, n) if hasattr(tb, 'lesson_name')
+              else f'teamkit-lesson-{len(names)}')
+        names.append(nm)
+        seeded += 1 if tb.seed_skill(nm, n) else 0
+    return {'names': names, 'seeded': seeded, 'duplicates': 0,
+            'errors': len(notes or []) - seeded, 'of': len(notes or [])}
 
 
 
@@ -817,6 +886,10 @@ def run_team(brief=None, spec=None, workspace='.', budget_calls=80, contract=Non
         result = _run_team_inner(rec, brief, spec, workspace, budget_calls,
                                  contract, model, base_url, roles, lessons,
                                  waive_lessons, max_empty_responses, on_run=on_run)
+        # R4-D4: recall attribution already merged into config.json by
+        # _run_team_inner; drop the private carrier key so the returned dict and
+        # summary.json keep exactly the documented key set.
+        result.pop('_recall_info', None)
         rec.pair = result.get('pair')
         # D4: outcome computed AFTER gating, from the run-start fingerprint vs
         # the state captured when the team stopped. Existing keys keep their
@@ -848,14 +921,25 @@ def _m0(model):
 
 
 def _record_config(ws, model, base_url, budget_calls, contract, roles, brief,
-                   spec, run_dir=None):
+                   spec, run_dir=None, recall=None):
     """config.json payload: resolved inputs + sha256 of the brief text (never
-    the text itself) + the contract verbatim."""
+    the text itself) + the contract verbatim + R4-D4 recall attribution.
+
+    `recall` is the _recall_info() dict. Only the two honest keys are kept:
+    recall_status (fired|empty|unavailable|error) and recall_hits, which holds
+    lesson NAMES/HASHES and their sizes, never lesson content.
+    """
     msg_text = (brief if brief else spec) or ''
-    return {"run_dir": run_dir, "workspace": ws, "model": model,
-            "base_url": base_url, "budget_calls": budget_calls,
-            "contract": contract, "roles": roles,
-            "brief_sha256": sha256_text(msg_text)}
+    cfg = {"run_dir": run_dir, "workspace": ws, "model": model,
+           "base_url": base_url, "budget_calls": budget_calls,
+           "contract": contract, "roles": roles,
+           "brief_sha256": sha256_text(msg_text)}
+    if recall:
+        cfg['recall_status'] = recall.get('recall_status')
+        cfg['recall_hits'] = recall.get('recall_hits') or []
+        if recall.get('recall_error'):
+            cfg['recall_error'] = recall['recall_error']
+    return cfg
 
 
 def _run_team_inner(rec, brief, spec, workspace, budget_calls, contract, model,
@@ -883,9 +967,14 @@ def _run_team_inner(rec, brief, spec, workspace, budget_calls, contract, model,
 
     base_url = base_url or (TP_COMPAT if model.startswith('openai/') else TP_ANTH)
     model, base_url = _lane_check(model, base_url)
+    # TDAI read path, run BEFORE the config record is written so attribution
+    # lands in config.json (R4-D4). One hub read per run: the same dict feeds both
+    # the record and the PRIOR LEARNINGS block appended to the message below.
+    recall_info = _recall_info(_tdai(), os.path.basename(str(workspace).rstrip('/'))
+                               + ' ' + (brief or spec or '')[:400])
     record_config(rec, _record_config(os.path.abspath(workspace or '.'), model,
                                       base_url, budget_calls, contract, roles,
-                                      brief, spec, rec.run_dir))
+                                      brief, spec, rec.run_dir, recall=recall_info))
     llm = LLM(model=model, api_key=_key(), base_url=base_url)
     from openhands.sdk.subagent.registry import _agent_factories, _registry_lock
     for d in defs:
@@ -929,7 +1018,10 @@ def _run_team_inner(rec, brief, spec, workspace, budget_calls, contract, model,
     if contract:
         msg += "\n\nDELIVERABLE CONTRACT (verify each): " + json.dumps(contract, ensure_ascii=False)
     # TDAI read path: shared team memory recall appended when a key is present.
-    msg += _recall_block(os.path.basename(workspace.rstrip('/')) + ' ' + (brief or spec or '')[:400])
+    # The hub call already happened above (once per run), and its attribution is
+    # in config.json; R4-D4 matters because this text is appended AFTER brief
+    # hashing, so the record alone could not otherwise say what memory added.
+    msg += _recall_block('', recall_info)[0]
     conv.send_message(msg)
     # iteration cap + tightened stuck thresholds are set at Conversation ctor
     # above; run() itself takes no args in v1.54
@@ -951,18 +1043,43 @@ def _run_team_inner(rec, brief, spec, workspace, budget_calls, contract, model,
     # state — NOT orchestrator prose
     status, gate_ok, gate_out, pair = evaluate_gate(rec, contract, workspace)
 
-    # lessons gate (owner rule 2026-10-11): every run must end with seeded learnings or an explicit waiver
+    # lessons gate (owner rule 2026-10-11): every run must end with seeded
+    # learnings or an explicit waiver.
+    # R4-D3 seed policy: a lesson from a run that abstained, failed, or was
+    # refused teaches the next run a mistake, so auto-seeding is allowed only
+    # for outcome in SEEDABLE_OUTCOMES. Anything else either carries an
+    # explicit `lessons=[]` waiver or records SKIPPED_NOT_RETAINED WITHOUT
+    # calling the hub. And a batch where fewer notes landed than were handed
+    # over is `partial`, never a silently-done stage.
+    # A keyless or hub-down bridge is the documented no-op path (hard
+    # constraint: behaves exactly as today), so `unavailable` is NOT partial.
+    outcome = _outcome_for(rec, status, _work_evidence_for(rec))
+    seedable = outcome in SEEDABLE_OUTCOMES
+    explicit_waiver = isinstance(lessons, list) and not lessons
     stage_start(rec, 'lessons')
     lesson_status = 'WAIVED: ' + waive_lessons if waive_lessons else None
+    if lesson_status is None and explicit_waiver:
+        lesson_status = 'WAIVED: lessons=[] (explicit)'
     lesson_err = None
+    lesson_partial = False
     try:
         if lessons:
-            lesson_status = json.dumps(learn_out(workspace, lessons))
-        elif not waive_lessons:
+            if seedable:
+                res = learn_out(workspace, lessons)
+                lesson_status = json.dumps(res)
+                landed = int(res.get('seeded', 0) or 0)
+                lesson_partial = (landed < len(lessons)
+                                  and res.get('tdai') != 'unavailable')
+            else:
+                lesson_status = f'SKIPPED_NOT_RETAINED: outcome={outcome}'
+                lesson_partial = True
+        elif not (waive_lessons or explicit_waiver):
             lesson_status = 'LESSONS_REQUIRED: pass lessons=[...] or waive_lessons="reason"'
     except Exception as exc:
         lesson_err = exc
-    stage_end(rec, 'lessons', 'fail' if lesson_err else 'done', lesson_err)
+    stage_end(rec, 'lessons',
+              'fail' if lesson_err else ('partial' if lesson_partial else 'done'),
+              lesson_err)
 
     diff = subprocess.run(['git', '-C', workspace, 'diff', '--stat'], capture_output=True, text=True)
     committed = subprocess.run(['git', '-C', workspace, 'log', '--oneline', '-5'], capture_output=True, text=True)
@@ -975,6 +1092,9 @@ def _run_team_inner(rec, brief, spec, workspace, budget_calls, contract, model,
         "recent_commits": committed.stdout,
         "orchestrator_final": (getattr(conv, 'state', None) and str(conv.state)[-400:]) or '',
         "pair": pair,
+        # R4-D4: handed to run_team(), which merges it into config.json and pops
+        # so the returned dict keeps its documented key set.
+        "_recall_info": recall_info,
     }
 
 

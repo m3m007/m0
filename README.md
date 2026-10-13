@@ -68,6 +68,8 @@ Then edit `router/router.yaml`. Its `probes:` block demands provenance; unprobed
 - Sub-agent delegation incident (2026-10-05) closed 2026-10-13: root cause was our own frontmatter wiring; live probe confirms children get terminal + file_editor. `team/` map_agents still untested end-to-end under real spawning (`docs/DELEGATION-INCIDENT.md`).
 - Cost tracked in requests, not dollars (no price map for these lanes).
 - Model-authored commands are recorded, never auto-executed by the harness.
+- Memory (TDAI): the atomic half of recall is empty by construction. `/v3/conversation/add` ingestion does not exist yet, so `/v3/atomic/search` can only ever return nothing. The skill-asset half is the live path. See `team/tdai-bridge.py`.
+- Memory (TDAI): the bridge is two files that must stay byte-identical, `team/tdai-bridge.py` (repo-owned, imported by teamkit) and `~/.hermes/scripts/tdai-bridge.py` (executor-readable, used by scripts outside this repo). `tests/test_tdai_bridge.py` fails on drift.
 
 ## Reading order
 
