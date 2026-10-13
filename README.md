@@ -290,6 +290,12 @@ neither can spend anything:
 `team/run_team.py`'s own `--plan` / `--dry-run` flags are a different code path
 and are untouched.
 
+Two knobs keep evidence out of the way of tests and CI (both default to sane
+places): `TEAMKIT_RUNS_DIR` relocates the record tree (default `<repo>/runs`,
+gitignored) and `TEAMKIT_BASE_TMP` relocates the pristine-baseline temp dir
+(default the system temp). The offline suite sets both to its own `tmp_path`, so
+no test ever writes into the real `runs/` it is auditing.
+
 ---
 
 ## The four rules this repo enforces in code
