@@ -1,6 +1,6 @@
 # DELEGATION-INCIDENT. Before trusting any "team" claim here
 
-**Date:** 2026-10-05 · Found at the very start of the brief, before any deliverable.
+**Date:** 2026-10-05 · **Status 2026-10-13: CLOSED.** Delegation works; the incident was RC1 in our own wiring, fixed in #2892. SDK v1.54 `LocalConversation` auto-registers file agents from `{project}/.agents/agents`, `{project}/.openhands/agents`, `~/.agents/agents`, `~/.openhands/agents`. Live probe (clean frontmatter): child spawned via `task` reported `CHILD_TOOLS: terminal, file_editor, finish, think` and used both exec tools. Original report kept below as history.
 
 ## What happened
 

@@ -56,7 +56,7 @@ Then edit `router/router.yaml`. Its `probes:` block demands provenance; unprobed
 
 ## Limitations
 
-- Sub-agent delegation broken: unresolved tool-registration defect (`docs/DELEGATION-INCIDENT.md`). "Multi-agent" here = one orchestrator over parallel role conversations.
+- Sub-agent delegation incident (2026-10-05) closed 2026-10-13: root cause was our own frontmatter wiring; live probe confirms children get terminal + file_editor. `team/` map_agents still untested end-to-end under real spawning (`docs/DELEGATION-INCIDENT.md`).
 - Cost tracked in requests, not dollars (no price map for these lanes).
 - Model-authored commands are recorded, never auto-executed by the harness.
 

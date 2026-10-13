@@ -48,11 +48,11 @@ Ordered by how hard each check is to fake.
 
 Probe labels: `verified_here` = probed on this machine with captured output; `verified_in_brief` = owner's probes assert it, nobody re-checked. Router refuses `tools_required` lanes below `verified_in_brief`.
 
-Degradation hook: `one_shot_outside_loop: true` on a lane allows endpoint-probe-only use outside tool loops (reason must be commented at the lane). Currently unused; all roles run in-loop. The real open degradation is broken sub-agent delegation (`docs/DELEGATION-INCIDENT.md`). `team/` works because each role is a direct Conversation from this process.
+Degradation hook: `one_shot_outside_loop: true` on a lane allows endpoint-probe-only use outside tool loops (reason must be commented at the lane). Currently unused; all roles run in-loop. Sub-agent delegation was fixed by #2892 plus SDK auto-registration (`docs/DELEGATION-INCIDENT.md` closed). `team/` works because each role is a direct Conversation from this process.
 
 ## 4. Known limits
 
-- **Delegation broken**: `task` hands sub-agents only `finish`/`think`; separate tool-registration defect, not RC1. "Multi-agent" = one orchestrator, parallel role conversations, disjoint files. Stated plainly, works.
+- **Delegation incident closed 2026-10-13**: Oct-5 `NO_EXEC_TOOLS` was RC1 in our wiring (#2892). SDK auto-registers file agents from project/user `.agents|.openhands/agents`; live probe child received terminal+file_editor. Remaining: validate `team/` map_agents under real spawning.
 - **Caps in requests, not dollars**: no litellm price map for these ids, SDK USD guard can never trip; `Team._charge` is the only enforcement that functions.
 - `max_budget_per_run` / `prompt_cache_key` need `LocalConversation`; public factory rejects them. Use `router.public_conversation_kwargs()`.
 - Empty-turn loop is stochastic (silence or prose escape, both observed); the guard checks the deterministic harm: a crippled agent.

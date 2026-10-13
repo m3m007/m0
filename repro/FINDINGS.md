@@ -52,7 +52,7 @@ Via `fix/oh_compat.correct_llm_kwargs()`: prefix must match base_url, `streaming
 
 ## Still live
 
-The orchestrator's own `task` tool reports `['finish', 'think']`, the same fingerprint; delegation channel affected (`docs/DELEGATION-INCIDENT.md`). Likely fix: role files in a scanned dir (`~/.openhands/agents` etc., none exist here) with frontmatter on line 1 + RC3 import order. Untested, deliberately not applied mid-session; tracked as unfinished work.
+Closed 2026-10-13, no bug to report. SDK v1.54 `LocalConversation` auto-registers file agents (`register_file_agents`; scan order: project `.agents/agents`, project `.openhands/agents`, `~/.agents/agents`, `~/.openhands/agents`). Live probe with frontmatter on line 1: child spawned via `task` reported terminal+file_editor available and used both. The Oct-5 failure was RC1 in our own wiring (fixed in #2892). Note: the child's first run flagged a "forbidden_tools" preamble as planted. That narrative came from agent paranoia in an earlier prompt, not our spec format; clean second probe behaved correctly.
 
 ## Reproduce
 
