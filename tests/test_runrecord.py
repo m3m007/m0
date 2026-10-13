@@ -30,6 +30,10 @@ from team import teamkit as tk  # noqa: E402
 
 LEGACY_KEYS = {"status", "gate", "gate_tail", "lessons", "workdir_diff",
                "recent_commits", "orchestrator_final"}
+# R2 adds exactly two keys on top of R1's shape ({run_dir, "pair"}): the outcome
+# split itself, and the git evidence the abstained/partial_work verdict was
+# computed from — auditable, never a bare label.
+ADDED_KEYS = {"run_dir", "pair", "outcome", "work_evidence"}
 
 
 # --------------------------------------------------------------- openhands stub
@@ -179,13 +183,15 @@ def test_every_run_persists_config_state_summary(tmp_path, monkeypatch,
 
 def test_return_dict_stays_byte_compatible_plus_run_dir(tmp_path, monkeypatch,
                                                         runs_env):
-    """Old callers see the old keys with the old meaning; only run_dir/pair added."""
+    """Old callers see the old keys with the old meaning; only run_dir/pair/
+    outcome/work_evidence are added."""
     ws = tmp_path / "myproj"
     ws.mkdir()
     result = do_run(monkeypatch, [], ws, contract={"gate": "true"})
     assert LEGACY_KEYS <= set(result)
-    assert set(result) == LEGACY_KEYS | {"run_dir", "pair"}
+    assert set(result) == LEGACY_KEYS | ADDED_KEYS
     assert result["pair"] is None, "legacy single gate reports no pair check"
+    assert result["outcome"] == "success"
     assert result["gate"] == "true"
     assert result["lessons"] == "WAIVED: unit test"
 

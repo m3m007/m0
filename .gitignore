@@ -9,3 +9,9 @@ runs/
 **/raw_responses/*.json
 !**/raw_responses/*.redacted.json
 .env
+__pycache__/
+*.pyc
+.pytest_cache/
+runs/repro/raw/
+*.log
+.env

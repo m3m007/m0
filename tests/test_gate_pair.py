@@ -103,7 +103,8 @@ def test_legacy_single_gate_pass_status_is_unchanged(monkeypatch, repo):
     res = do_run(monkeypatch, repo, {"gate": "true"})
     assert res["status"] == "GATE_PASS", "legacy status string kept"
     assert res["pair"] is None, "no incumbent_gate => pair stays null"
-    assert set(res) == LEGACY_KEYS | {"run_dir", "pair"}
+    assert set(res) == LEGACY_KEYS | {"run_dir", "pair", "outcome",
+                                      "work_evidence"}
 
 
 def test_legacy_single_gate_fail_status_is_unchanged(monkeypatch, repo):
