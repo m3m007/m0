@@ -31,9 +31,18 @@ Model lanes, endpoints and provider names live in local config only.
 
 ## Quick start
 
+Test commands are exact, because the interpreter is load-bearing:
+
+* **pytest runs on bare `/usr/bin/python3`.** The repo-root `conftest.py` appends the SDK venv's site-packages, so system python (which has pytest) can import `openhands`. Observed live, the same run on the venv python died instantly with "No module named pytest", so `tests/test_e2e_smoke.py` refuses any interpreter but system python under `SMOKE_LIVE` and prints the working command (`MULTIAGENT_PY` opts out of the check).
+* **the `team/run_team.py` CLI needs an interpreter that can import the SDK**, so it takes the venv python, or system python with `PYTHONPATH` pointed at the venv's site-packages. The conftest shim is pytest-only.
+
 ```bash
-V=<venv-with-openhands-sdk>/bin/python
-$V -m pytest tests/ -q                            # 0 calls
+PY=/usr/bin/python3                              # system python: the pytest interpreter
+$PY -m pytest tests/ -q                                   # 0 calls
+$PY -m pytest tests/test_e2e_smoke.py -q                  # 0 calls (offline smoke)
+SMOKE_LIVE=1 $PY -m pytest tests/test_e2e_smoke.py -q -s  # live smoke: real run, spends requests
+
+V=<venv-with-openhands-sdk>/bin/python           # SDK interpreter: the CLI runner
 $V team/run_team.py --plan    --brief BRIEF.md    # 0 calls
 $V team/run_team.py --dry-run --brief BRIEF.md --workspace REPO
 $V team/run_team.py --brief BRIEF.md --workspace REPO --max-requests 60

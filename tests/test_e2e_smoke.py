@@ -2,8 +2,17 @@
 
 Two modes, and the default one costs nothing:
 
-    python3 -m pytest tests/test_e2e_smoke.py -q          # offline: 0 requests
-    SMOKE_LIVE=1 python3 -m pytest tests/test_e2e_smoke.py -q   # real run, ~15-30
+    /usr/bin/python3 -m pytest tests/test_e2e_smoke.py -q          # offline: 0 requests
+    SMOKE_LIVE=1 /usr/bin/python3 -m pytest tests/test_e2e_smoke.py -q -s   # real run, ~15-30
+
+The interpreter is part of the command, not a detail. Observed live: the same
+run started with the oh-venv python died instantly with "No module named
+pytest", because the working direction is system python (which has pytest and
+is what the gate uses) plus the SDK venv's site-packages, which the repo-root
+conftest.py appends for bare /usr/bin/python3. The guard below refuses any
+other interpreter under SMOKE_LIVE and prints this command line, rather than
+letting the run die with an error that reads like a broken harness. Set
+MULTIAGENT_PY to opt out of the check.
 
 Why two modes. A smoke test that always spends quota gets run once and then
 dreaded; one that costs nothing gets run every commit. The live path is the
@@ -41,8 +50,42 @@ sys.path.insert(0, str(REPO))
 from tests.probe_budget import ceiling_from_router, total  # noqa: E402
 from team.run_team import Task, Team  # noqa: E402
 
-LIVE = os.environ.get("SMOKE_LIVE", "").strip().lower() in {"1", "true", "yes"}
+def smoke_live() -> bool:
+    """Is the live tier asked for? Read per call, so the guard is testable."""
+    return os.environ.get("SMOKE_LIVE", "").strip().lower() in {"1", "true", "yes"}
+
+
+LIVE = smoke_live()
 SMOKE_SRC = REPO / "tests" / "smoke_repo"
+
+#: The one interpreter the live suite works on. See the module docstring.
+SYSTEM_PYTHON = "/usr/bin/python3"
+
+
+def assert_live_interpreter(executable: str | None = None) -> None:
+    """Refuse to run the live suite on an interpreter that cannot load pytest.
+
+    Checked at collection time, before a single request can be spent, because
+    the venv python fails the run with "No module named pytest" and the obvious
+    reading of that is "the harness is broken" rather than "wrong interpreter".
+
+    ``MULTIAGENT_PY`` overrides the comparison (point it at the interpreter you
+    deliberately want), and nothing here touches the network or the filesystem.
+    """
+    if not smoke_live():
+        return
+    if os.environ.get("MULTIAGENT_PY", "").strip():
+        return
+    current = Path(executable or sys.executable or "").resolve()
+    if current == Path(SYSTEM_PYTHON).resolve():
+        return
+    pytest.fail(
+        f"SMOKE_LIVE needs the system python, not {current}. Run: "
+        f"SMOKE_LIVE=1 {SYSTEM_PYTHON} -m pytest tests/test_e2e_smoke.py -q -s",
+        pytrace=False)
+
+
+assert_live_interpreter()
 
 # The known-good task split for smoke_repo. Used in the offline run and as the
 # spec the live run compares against, so "the architect produced a spec" is a
