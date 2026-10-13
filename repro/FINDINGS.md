@@ -1,4 +1,4 @@
-# FINDINGS — why the OpenHands team run produced "no tool call and no content"
+# FINDINGS. Why the OpenHands team run produced "no tool call and no content"
 
 Date: 2026-10-05 · Investigated in: `/home/hermes/projects/multiagent-stack`
 Cost of the investigation's decisive experiment: **0 API calls.**
@@ -11,7 +11,7 @@ The failure was **not** thinking-model handling, **not** `model_features.py`, an
 **not** the `anthropic/` transport. Both <lane> endpoints return proper tool
 calls for `<lane>`, and a full OpenHands agent turn on `<lane>`
 completes a real multi-step task with a 93% cache hit. The real defect is that
-**our sub-agents were spawned with zero executable tools** — they could only see
+**our sub-agents were spawned with zero executable tools**. They could only see
 `finish` and `think`. Each turn therefore produced neither a usable tool call nor
 text, the framework injected corrective feedback, and the loop repeated until the
 stuck-detector killed the task. Three separate usage errors on our side caused
@@ -19,7 +19,7 @@ it, and the SDK's sin is that **none of them raise**.
 
 ## 2. Root causes
 
-### RC1 — role Markdown frontmatter was not on line 1 (primary cause)
+### RC1. Role Markdown frontmatter was not on line 1 (primary cause)
 
 Our role files open with a title line:
 
@@ -48,7 +48,7 @@ python-frontmatter only recognises frontmatter when the **first line** is exactl
 **Nothing raises.** The file is valid Markdown, the definition loads, the agent
 constructs. The failure only shows up as wasted quota minutes later.
 
-### RC2 — `model:` in a role file is a PROFILE NAME, not a model id
+### RC2. `model:` in a role file is a PROFILE NAME, not a model id
 
 `subagent/registry.py:216-226` treats a non-`inherit` `model:` as a key into an
 `LLMProfileStore` and raises `ValueError: Profile ... not found in profile store`
@@ -60,7 +60,7 @@ empty. `oh_team2/architect.md` sets `model: <lane>`.
 lookup never ran. Fix RC1 alone and the run trades a silent loop for a hard
 crash at spawn. Both must be fixed together.
 
-### RC3 — the tool registry is populated lazily
+### RC3. The tool registry is populated lazily
 
 `agent_definition_to_factory` validates declared tools against
 `list_registered_tools()`. That registry is empty (`['ClassifyAndSwitchLLMTool']`)
@@ -111,23 +111,23 @@ The warning text comes from `agent/response_dispatch.py:364-371`
     return LLMResponseType.EMPTY
 ```
 
-Note the log line "Available: `['finish', 'think']`" — that is RC1's fingerprint,
-and it is exactly what the live `task` tool reports today (see §6).
+Note the log line "Available: `['finish', 'think']`". That is RC1's fingerprint,
+and it is exactly what the live `task` tool reports today (see section 6).
 
-## 4. Hypotheses tested and killed (the honest list)
+## 4. Hypotheses tested and killed
 
 | # | Hypothesis | Source | Test | Result |
 |---|---|---|---|---|
-| H1 | **`model_features.py` curated lists lack our model ids → thinking misconfigured → empty turns** | the brief's own lead | `repro/show_kwargs.py` (0 calls): dump `get_features()` + outbound kwargs | **REFUTED.** `<lane>` → `thinking_mode=none`, `supports_extended_thinking=False`, `send_reasoning_content=False`. `thinking_mode=none` means the SDK sends **no** thinking kwargs at all — there is nothing to misconfigure. Both lanes emit the identical 10-key kwarg set. |
+| H1 | **`model_features.py` curated lists lack our model ids, so thinking gets misconfigured into empty turns** | the brief's own lead | `repro/show_kwargs.py` (0 calls): dump `get_features()` + outbound kwargs | **REFUTED.** `<lane>` → `thinking_mode=none`, `supports_extended_thinking=False`, `send_reasoning_content=False`. `thinking_mode=none` means the SDK sends **no** thinking kwargs at all, so there is nothing to misconfigure. Both lanes emit the identical 10-key kwarg set. |
 | H2 | The `anthropic/` transport/endpoint is broken for tool calls | brief's framing | `repro/raw_curl.sh anthropic` (1 call) | **REFUTED.** `stop_reason=tool_use`, `blocks=['thinking','tool_use']`, `get_weather({"city": "Osaka"})`. |
 | H3 | LiteLLM mis-parses anthropic-messages tool responses | implied by H2 | `repro/ab_probe.py --lane both` (2 calls) | **REFUTED.** Both transports: `finish=tool_calls`, 1 tool call, valid JSON args. |
-| H4 | Failure is in the SDK layer above litellm (message formatting / response parsing) | — | `repro/sdk_conversation.py --lane anthropic` (1 call) | **REFUTED.** Real `Agent`+`Conversation` on `<lane>` ran `TerminalAction` then `FinishAction`, wrote the file, task verified. |
+| H4 | Failure is in the SDK layer above litellm (message formatting / response parsing) | n/a | `repro/sdk_conversation.py --lane anthropic` (1 call) | **REFUTED.** Real `Agent`+`Conversation` on `<lane>` ran `TerminalAction` then `FinishAction`, wrote the file, task verified. |
 | H5 | `send_reasoning_content` gap causes it | brief's hint | `model_features.py:294` + `get_features` | **Real gap, irrelevant cause.** The list entry `deepseek/<lane>` never matches our id `<lane>` because `model_matches` is case-insensitive *substring* matching (model_features.py:280 note) against a differently-prefixed id, and `capability_overrides` does not expose `send_reasoning_content` (verified in `tests/test_oh_compat.py`). Tool calling is unaffected. |
-| H6 | Missing `max_output_tokens` truncation (endpoint requires it) | — | kwargs dump + raw curl | **REFUTED as cause.** We send no `max_tokens` via the SDK and still get tool calls; raw curls that *did* set `max_tokens` also succeeded. |
-| H7 | **RC1/RC2/RC3 — tool wiring** | log grep | `repro/subagent_tools.py` (**0 calls**) | **CONFIRMED.** All four on-disk role files parse to `tools=[]`. Byte-identical file with `---` on line 1 parses to `['terminal','file_editor']`. |
+| H6 | Missing `max_output_tokens` truncation (endpoint requires it) | n/a | kwargs dump + raw curl | **REFUTED as cause.** We send no `max_tokens` via the SDK and still get tool calls; raw curls that *did* set `max_tokens` also succeeded. |
+| H7 | **RC1/RC2/RC3, tool wiring** | log grep | `repro/subagent_tools.py` (**0 calls**) | **CONFIRMED.** All four on-disk role files parse to `tools=[]`. Byte-identical file with `---` on line 1 parses to `['terminal','file_editor']`. |
 
 Also corrected along the way: the brief cites `oh-netflow-team.log` for
-timestamps 01:27/01:34/01:54 — that file does contain them (§3). My first grep
+timestamps 01:27/01:34/01:54, and that file does contain them (section 3). My first grep
 missed it because I searched the full sentence while the logger **truncates** the
 message to `LLM response contained no`. A reminder to grep on fragments, not
 assumptions.
@@ -150,7 +150,7 @@ llm = LLM(
     drop_params=True,
     retry_max_attempts=3, retry_multiplier=2.0,
     retry_min_wait=2, retry_max_wait=30,
-    # OPTIONAL public override hook (llm.py:459) — the brief asked whether one
+    # OPTIONAL public override hook (llm.py:459). The brief asked whether one
     # exists. It does, and it is the right lever if a lane ever needs thinking:
     # capability_overrides={"thinking_mode": "manual", "supports_prompt_cache": True},
 )
@@ -164,7 +164,7 @@ Traps the tests pin down:
   `LocalConversation.__init__` varnames).
 - **`anthropic/x` with a `compatible-mode` base_url** (or vice versa) answers an
   opaque HTTP 400. `validate_lane()` rejects it before any spend.
-- **`send_reasoning_content` is not overridable** — curated-list only (H5).
+- **`send_reasoning_content` is not overridable**, curated-list only (H5).
 
 ## 6. This is not merely historical
 
@@ -175,7 +175,7 @@ My own sub-agents in this very session reported:
 `['finish', 'think']` is precisely RC1's fingerprint. The live `task` tool is
 reading role files that suffer the same leading-title-line frontmatter problem,
 so **the delegation channel of this orchestrator is affected by the same root
-cause**. Details and the honest consequences are in
+cause**. Details and the consequences are in
 `docs/DELEGATION-INCIDENT.md`.
 
 Candidate remedy (untested, and deliberately not applied): the discovered search
@@ -183,19 +183,19 @@ paths are `~/.agents/agents`, `~/.openhands/agents`, `<project>/.agents/agents`,
 `<project>/.openhands/agents`; **none exist on this box**. Re-creating the role
 files there with frontmatter on line 1, plus RC3's preset import, is the
 likely fix. I am not editing the orchestrator's own runtime configuration
-mid-session on the strength of an untested inference — that is a follow-up, and
+mid-session on the strength of an untested inference. That is a follow-up, and
 it is listed in `DONE.md` as unfinished work rather than claimed as done.
 
 ## 7. Reproduce it yourself
 
 ```bash
 V=/home/hermes/.hermes/cache/scratch/oh-venv/bin/python
-$V repro/subagent_tools.py            # 0 calls  — the root cause, deterministically
-$V repro/show_kwargs.py --json        # 0 calls  — the kwargs the SDK really sends
-./repro/raw_curl.sh both              # 2 calls  — both endpoints, raw, healthy
-$V repro/ab_probe.py --lane both      # 2 calls  — litellm layer, both transports
-$V repro/sdk_conversation.py --lane anthropic   # 1 call — full agent turn works
-$V -m pytest tests/ -q                # 0 calls  — 43 tests, all offline
+$V repro/subagent_tools.py            # 0 calls: the root cause, deterministically
+$V repro/show_kwargs.py --json        # 0 calls: the kwargs the SDK really sends
+./repro/raw_curl.sh both              # 2 calls: both endpoints, raw, healthy
+$V repro/ab_probe.py --lane both      # 2 calls: litellm layer, both transports
+$V repro/sdk_conversation.py --lane anthropic   # 1 call: full agent turn works
+$V -m pytest tests/ -q                # 0 calls: 43 tests, all offline
 ```
 
 `runs/` is gitignored; every capture passes through `lib.keys.redact()` on the
