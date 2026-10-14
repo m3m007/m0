@@ -93,6 +93,15 @@ class Lane:
     probes: Probes = field(default_factory=Probes)
     expires: str | None = None
     degraded: bool = False
+    #: R5-D3: per-lane override of the in-loop-blocked model prefixes. None means
+    #: "inherit defaults.inloop_blocked_prefixes", so the policy has one home in
+    #: the config file and a lane only deviates from it on purpose.
+    inloop_blocked_prefixes: tuple[str, ...] | None = None
+    #: R5-D3: the request-shaping knobs resolved lane-else-defaults
+    #: (drop_params, retry_*, streaming). They used to be re-hardcoded inside
+    #: fix.oh_compat.correct_llm_kwargs, which meant router.yaml was advice
+    #: rather than policy; now the config file is authoritative for them.
+    params: dict[str, Any] = field(default_factory=dict)
 
     @property
     def transport(self) -> str:
@@ -106,6 +115,10 @@ class Lane:
         except ValueError:
             return False
         return (today or dt.date.today()) > end
+
+
+PARAM_KEYS = ("drop_params", "retry_max_attempts", "retry_multiplier",
+              "retry_min_wait", "retry_max_wait", "streaming")
 
 
 class Router:
@@ -185,6 +198,14 @@ class Router:
                 ),
                 expires=spec.get("expires"),
                 degraded=bool(spec.get("degraded", False)),
+                inloop_blocked_prefixes=_prefixes(spec.get(
+                    "inloop_blocked_prefixes")),
+                # R5-D3: lane value wins, else defaults, else the hardcoded
+                # fallback below. This is what makes router.yaml authoritative
+                # for the knobs a teamkit facade run used to invent itself.
+                params={k: spec.get(k, self._default(k, fb))
+                        for k, fb in zip(PARAM_KEYS,
+                                         (True, 3, 2.0, 2, 30, False))},
             )
         return lanes
 
@@ -250,6 +271,23 @@ class Router:
                 "this lane, or drop enable_thinking.")
 
     # ------------------------------------------------------------ selection
+    def inloop_blocked_prefixes(self, role: str | None = None) -> tuple[str, ...]:
+        """R5-D3: the declarative replacement for teamkit's hardcoded tuple.
+
+        Models here are confirmed in-loop empty-response killers on the
+        anthropic-messages route. Resolution order: a lane's own
+        ``inloop_blocked_prefixes`` wins when it declares one; otherwise the
+        config-wide ``defaults.inloop_blocked_prefixes``. An absent key yields
+        ``()`` — callers that need a safety net (teamkit) keep a defensive
+        fallback rather than silently losing the guard.
+        """
+        if role is not None:
+            lane = self.lane_for(role)
+            if lane.inloop_blocked_prefixes is not None:
+                return lane.inloop_blocked_prefixes
+        declared = self.defaults.get("inloop_blocked_prefixes")
+        return _prefixes(declared) or ()
+
     def lane_for(self, role: str, *, allow_untrusted: bool = False,
                  allow_expired: bool = False) -> Lane:
         """Resolve a role to a lane, refusing configurations that are not proven.
@@ -315,6 +353,8 @@ class Router:
                              allow_expired=allow_expired)
         kwargs = correct_llm_kwargs(lane.model, temperature=lane.temperature,
                                     capability_overrides=lane.capability_overrides or None)
+        # R5-D3: the config file, not oh_compat's literals, decides these.
+        kwargs.update(lane.params)
         if lane.transport == "kimi":
             from lib.keys import kimi_key
 
@@ -330,6 +370,18 @@ class Router:
         from openhands.sdk import LLM
 
         return LLM(**self.llm_kwargs(role, **kwargs))
+
+    def build_llm_from_kwargs(self, kwargs: dict[str, Any]):
+        """Build an LLM from a kwargs dict resolved by the CALLER.
+
+        R5-D3 exists for the teamkit facade: it overrides the lane *model* from
+        its own argument while inheriting everything else from the lane, so its
+        kwargs are lane-derived but not lane-named, and `llm_kwargs(role)` no
+        longer fits. The SDK import stays lazy so offline tests never need it.
+        """
+        from openhands.sdk import LLM
+
+        return LLM(**kwargs)
 
     def conversation_kwargs(self, role: str, *, cache_key_salt: str = "") -> dict[str, Any]:
         """Budget + prefix-cache settings for a LocalConversation.
@@ -412,6 +464,20 @@ class Router:
 
 
 # -------------------------------------------------------------- helpers
+def _prefixes(value: Any) -> tuple[str, ...] | None:
+    """Normalise an ``inloop_blocked_prefixes`` declaration.
+
+    None stays None (that is what distinguishes "not declared" from "declared
+    empty", which is how a lane opts OUT of the default policy). A scalar is a
+    one-item list, because YAML authors write both.
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return (value,)
+    return tuple(str(v) for v in value)
+
+
 def _record(model: str, source: str, calls: int = 1) -> None:
     """Append to the owner's tokenwatch ledger via lib.ledger (the chokepoint).
 

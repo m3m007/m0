@@ -30,6 +30,14 @@ defaults:
   max_iterations: 25
   max_requests_per_run: 40
   concurrency_limit: 2
+  # R5-D3: the lane policy that used to be a hardcoded tuple in team/teamkit.py.
+  # Models on the anthropic-messages route die in-loop with empty, tool-less
+  # responses (confirmed twice: netflow deepseek 2026-10-05, bcnbus qwen3.8-flash
+  # 2026-10-11). Declaring them here makes the guard auditable next to the lanes
+  # it protects, and a lane may narrow or widen the list for itself.
+  inloop_blocked_prefixes:
+    - qwen3.8-flash
+    - deepseek-v4
 
 budget:
   caps_requests:            # plan windows, requests (mirrors tokenwatch.py caps)
