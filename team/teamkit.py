@@ -58,18 +58,6 @@ RECALL_STATUSES = ('fired', 'empty', 'unavailable', 'error')
 _INLOOP_BLOCKED_ON_ANTHROPIC = ('qwen3.8-flash', 'deepseek-v4')
 
 
-def _lane_check(model, base_url):
-    """Return corrected (model, base_url) or raise before spending calls."""
-    if TP_ANTH in base_url and any(b in model for b in _INLOOP_BLOCKED_ON_ANTHROPIC):
-        raise ValueError(
-            f"LANE GUARD: model '{model}' on anthropic route is a confirmed in-loop "
-            "empty-response killer; use compatible-mode base_url (openai/ prefix) or "
-            "a thinking-native model (qwen3.8-max) on anthropic. See openhands-sdk-pilot skill.")
-    if TP_COMPAT in base_url and not model.startswith('openai/'):
-        model = 'openai/' + model.split('/')[-1]
-    return model, base_url
-
-
 def _tdai():
     """Optional TDAI memory-hub bridge (read/write paths). No key -> None:
     runs proceed exactly as before (zero regression). Never raises.
@@ -166,8 +154,21 @@ def learn_out(workspace, notes):
 
 
 def _key():
-    m = re.search(r"^  api_key: (.*)$", open(CFG).read(), re.M)
-    return m.group(1).strip().strip("'").strip('"')
+    """The API key for the Token Plan, matched to the token-plan base URL.
+
+    R5-D3: this used to be a regex for the FIRST `api_key:` line anywhere in the
+    owner's config, which is the right answer only while one provider lives in
+    the file. lib.keys pairs a key with a base_url mentioning the token-plan
+    host (and honours $BAILIAN_TOKEN_PLAN_API_KEY first). The regex stays as a
+    defensive fallback so a machine with an unusual config still runs.
+    """
+    try:
+        from lib.keys import token_plan_key
+
+        return token_plan_key()
+    except Exception:
+        m = re.search(r"^  api_key: (.*)$", open(CFG).read(), re.M)
+        return m.group(1).strip().strip("'").strip('"')
 
 
 def _known_tool_names():
@@ -441,12 +442,6 @@ def _thread_ident():
         return threading.get_ident()
 
 
-def run_slug(workspace):
-    """Slug = first 24 safe chars of basename(workspace)."""
-    s = re.sub(r'[^A-Za-z0-9._-]', '', os.path.basename(str(workspace).rstrip('/')))
-    return s[:24]
-
-
 def acquire_run_lock(slug, runs_root=RUNS_DIR):
     """O_EXCL lock per run slug holding our pid. Stale lock (dead pid) reclaimed.
 
@@ -644,329 +639,6 @@ def _refused(budget_calls):
             "reason": f"budget_calls={budget_calls} > {BUDGET_MAX_CALLS}; refusing before preflight"}
 
 
-# ---------------------------------------------------------------- D2: gate v2
-def git_workspace(workspace):
-    """Resolve the git work-tree that hosts `workspace` (walks up if needed).
-    Returns (root, pathspec) or (None, None) when not in a repo."""
-    p = subprocess.run(['git', '-C', str(workspace), 'rev-parse', '--show-toplevel'],
-                       capture_output=True, text=True)
-    if p.returncode == 0 and p.stdout.strip():
-        root = p.stdout.strip()
-        rel = os.path.relpath(os.path.abspath(workspace), root)
-        return root, ('' if rel == '.' else rel)
-    return None, None
-
-
-def _git_out(args, cwd=None):
-    try:
-        p = subprocess.run(args, cwd=cwd, capture_output=True, text=True)
-        return p.stdout.strip() if p.returncode == 0 else ''
-    except Exception:
-        return ''
-
-
-def _git_try(args, cwd=None):
-    """(ok, error_text) from a git command — ok is the RETURN CODE, never
-    "stderr was empty", which is how a silently refused worktree read as success."""
-    try:
-        p = subprocess.run(args, cwd=cwd, capture_output=True, text=True)
-    except Exception as exc:
-        return False, f'{type(exc).__name__}: {exc}'
-    return (p.returncode == 0), ((p.stderr or '').strip() or
-                                 f'exit {p.returncode}')
-
-
-def capture_baseline_ref(workspace):
-    """Pristine baseline, captured AT RUN START before the team touches anything.
-
-    Dirty workdir -> `git stash create` commit sha (created but NOT applied, so
-    the user's workdir is untouched). Clean -> HEAD sha.
-
-    Baseline means COMMITTED/STASHED state only: uncommitted tracked
-    modifications are included via the stash commit, but untracked files are
-    NOT. That is deliberate — see README (pair acceptance vs the incumbent).
-    """
-    root, _ = git_workspace(workspace)
-    if not root:
-        return None
-    status = subprocess.run(['git', '-C', root, 'status', '--porcelain'],
-                            capture_output=True, text=True).stdout.strip()
-    if status:
-        sc = subprocess.run(['git', '-c', 'user.email=teamkit@local',
-                             '-c', 'user.name=teamkit', 'stash', 'create'],
-                            cwd=root, capture_output=True, text=True).stdout.strip()
-        if sc:
-            return sc
-        # 'create' yields nothing when only untracked files exist -> HEAD
-    return _git_out(['git', '-C', root, 'rev-parse', 'HEAD']) or None
-
-
-def materialize_baseline(baseline_ref, workspace):
-    """Pristine copy of `baseline_ref` in a temp dir OUTSIDE runs/.
-
-    Returns (dest, cleanup_fn). `git worktree add --detach` first; if that fails
-    (some trees refuse worktrees) fall back to `git archive | tar -x`. Never
-    mutates the user workspace except the internal, prunable `.git` worktree
-    registration that `git worktree remove --force` + `prune` undo on cleanup.
-    """
-    root, rel = git_workspace(workspace)
-    dest = tempfile.mkdtemp(prefix='teamkit-baseline-',
-                            dir=os.environ.get('TEAMKIT_BASE_TMP') or None)
-    made_worktree = False
-
-    def cleanup():
-        if made_worktree:
-            subprocess.run(['git', '-C', root, 'worktree', 'remove', '--force',
-                            dest], capture_output=True, text=True)
-        else:
-            shutil.rmtree(dest, ignore_errors=True)
-        if root:                       # prune the internal registration only
-            subprocess.run(['git', '-C', root, 'worktree', 'prune'],
-                           capture_output=True, text=True)
-
-    err = 'no git work tree'
-    if root and os.path.isdir(dest) and not os.listdir(dest):
-        ok, err = _git_try(['git', '-C', root, 'worktree', 'add', '--detach',
-                            dest, baseline_ref], cwd=root)
-        if ok:
-            made_worktree = True
-        else:
-            # Fallback: `git archive | tar -x`. worktree add is refused on some
-            # trees, so the baseline still gets materialized, just untracked.
-            shutil.rmtree(dest, ignore_errors=True)
-            dest = tempfile.mkdtemp(prefix='teamkit-baseline-',
-                                    dir=os.environ.get('TEAMKIT_BASE_TMP') or None)
-            arc = subprocess.run(['git', '-C', root, 'archive', '--format=tar',
-                                  baseline_ref], capture_output=True)
-            if arc.returncode != 0:
-                cleanup()
-                raise RuntimeError(
-                    'baseline materialization failed: worktree=' + str(err)[-200:]
-                    + ' archive=' + arc.stderr.decode('utf-8', 'replace')[-200:])
-            try:
-                tar = subprocess.run(['tar', '-x', '-C', dest],
-                                     input=arc.stdout)
-            except FileNotFoundError as exc:      # no tar binary
-                cleanup()
-                raise RuntimeError('baseline materialization failed: ' + str(exc))
-            if tar.returncode != 0:
-                cleanup()
-                raise RuntimeError('baseline materialization failed: tar exit '
-                                   + str(tar.returncode))
-    if rel:
-        return os.path.join(dest, rel), cleanup
-    return dest, cleanup
-
-
-def run_gate(cmd, cwd):
-    """Run one gate command, timeout 900. -> {ok, rc, tail, error}."""
-    try:
-        p = subprocess.run(cmd, shell=True, cwd=str(cwd), capture_output=True,
-                           text=True, timeout=GATE_TIMEOUT)
-        return {"ok": p.returncode == 0, "rc": p.returncode, "ran": True,
-                "tail": ((p.stdout or '')[-500:] + (p.stderr or '')[-300:]),
-                "error": None}
-    except Exception as exc:
-        return {"ok": False, "rc": None, "ran": False, "tail": str(exc)[-500:],
-                "error": f'{type(exc).__name__}: {str(exc)[-300:]}'}
-
-
-def legacy_gate(contract, workspace):
-    """Pre-R1 gate: `gate` in the workspace once, exit 0 -> GATE_PASS.
-
-    The single implementation of the legacy path, shared by the normal flow and
-    the (unreachable-by-design) no-recorder fallback, so behaviour cannot drift.
-    """
-    r = run_gate(contract['gate'], workspace)
-    return ('GATE_PASS' if r['ok'] else 'GATE_FAIL'), r['ok'], r['tail'], None
-
-
-def evaluate_gate(rec, contract, workspace):
-    """Gate v1 (legacy, component only) or v2 (component + pair vs incumbent).
-
-    Exact statuses: g_new fail -> GATE_FAIL (incumbent retained); pass+pass ->
-    GATE_PASS_TIE; pass+fail -> GATE_PASS_NEW. With incumbent_gate present the
-    legacy string GATE_PASS is never emitted.
-    """
-    if rec is None:                     # recording unavailable: legacy path only
-        if not (contract and contract.get('gate')):
-            return 'RUN_DONE_NO_GATE', None, '', None
-        return legacy_gate(contract, workspace)
-    gate_cmd = (contract or {}).get('gate')
-    inc_cmd = (contract or {}).get('incumbent_gate')
-    stage_start(rec, 'gate')
-    if not gate_cmd:
-        stage_end(rec, 'gate', 'skipped')
-        return 'RUN_DONE_NO_GATE', None, '', None
-    r_new = run_gate(gate_cmd, workspace)
-    pair = None
-    if not inc_cmd:
-        stage_end(rec, 'gate', 'done' if r_new['ok'] else 'fail',
-                  None if r_new['ok'] else RuntimeError(r_new['tail'][-300:]))
-        status = 'GATE_PASS' if r_new['ok'] else 'GATE_FAIL'
-        return status, r_new['ok'], r_new['tail'], None
-    baseline_ref = (rec.baseline_ref or capture_baseline_ref(workspace))
-    head_ref = _git_out(['git', '-C', workspace, 'rev-parse', 'HEAD'])
-    r_base = {'ok': False, 'rc': None, 'tail': '', 'ran': False,
-              'error': 'no baseline ref: workspace is not a git work tree'}
-    cleanup = None
-    try:
-        if baseline_ref:
-            bdir, cleanup = materialize_baseline(baseline_ref, workspace)
-            r_base = run_gate(inc_cmd, bdir)
-            r_base['ran'] = True
-    except Exception as exc:
-        r_base = {'ok': False, 'rc': None, 'tail': str(exc)[-500:], 'ran': False,
-                  'error': f'{type(exc).__name__}: {str(exc)[-300:]}'}
-    finally:
-        if cleanup:
-            try:
-                cleanup()
-            except Exception:
-                pass
-    accepted = bool(r_new['ok'])
-    if not r_new['ok']:
-        status = 'GATE_FAIL'                       # incumbent retained
-    elif r_base['ok']:
-        status = 'GATE_PASS_TIE'                   # new matches the baseline
-    elif r_base['ran']:
-        status = 'GATE_PASS_NEW'                   # improvement, retained
-    else:
-        # A pair check that could not run proves nothing about the incumbent, so
-        # no improvement is claimed: TIE, with the reason recorded in g_base.error.
-        status = 'GATE_PASS_TIE'
-    stage_end(rec, 'gate', 'done' if accepted else 'fail',
-              None if accepted else RuntimeError(r_new['tail'][-300:]))
-    g_new = {'ok': r_new['ok'], 'rc': r_new['rc'], 'cmd': gate_cmd,
-             'error': r_new['error']}
-    g_base = {'ok': r_base['ok'], 'rc': r_base['rc'], 'cmd': inc_cmd,
-              'error': r_base['error'], 'ran': bool(r_base.get('ran', True))}
-    pair = {'g_new': g_new, 'g_base': g_base, 'baseline_ref': baseline_ref}
-    try:
-        rec.recorder.retained({'accepted': accepted, 'baseline_ref': baseline_ref,
-                               'head_ref': head_ref or None,
-                               'g_new': g_new, 'g_base': g_base})
-    except Exception:
-        pass
-    return status, accepted, (r_new['tail'] + '\n' + r_base['tail'])[-800:], pair
-
-
-# ---------------------------------------------------------- D4: outcome split
-# "Did the system fail" and "did the system do nothing" are different diseases:
-# a failed gate needs a better brief, a zero-work stall needs a lane fix.
-OUTCOMES = ('success', 'partial_work', 'abstained', 'refused', 'tie_kept')
-_OUTCOME_SUCCESS = ('GATE_PASS', 'GATE_PASS_NEW')
-_OUTCOME_WORKED = ('GATE_FAIL', 'RUN_DONE_NO_GATE', 'ERROR')
-_OUTCOME_REFUSED = ('BUDGET_REFUSED', 'DRY_PLAN')
-
-
-def capture_workspace_state(workspace):
-    """READ-ONLY run-start (and run-finish) fingerprint of a workspace.
-
-    Keys: root (git toplevel, or None when not a work tree), ws (the path it was
-    captured from), head (HEAD sha, or '' for an unborn repo), tracked (the full
-    `git diff HEAD` text), porcelain (the full `git status --porcelain -uall`
-    text) and sha256 digests of both.
-
-    Reuses the `git status --porcelain` capture pattern from
-    capture_baseline_ref(), but never runs `git stash create` — it leaves no
-    dangling object in the user's repo — so it is cheap and safe on EVERY path,
-    including runs with no incumbent_gate. Both digests are repo-wide, because
-    that is what the team can reach: a sub-agent holds a shell, so scoping the
-    diff to the workspace subdirectory would credit the run with edits it never
-    made (or hide edits it made next door).
-    """
-    root, _rel = git_workspace(workspace)
-    if not root:
-        return {'root': None, 'ws': str(workspace), 'head': '', 'tracked': '',
-                'porcelain': '', 'tracked_sha': '', 'porcelain_sha': ''}
-    porcelain = _git_out(['git', '-C', str(root), 'status', '--porcelain', '-uall'])
-    tracked = _git_out(['git', '-C', str(root), 'diff', '--no-color', 'HEAD'])
-    return {'root': root, 'ws': str(workspace),
-            'head': _git_out(['git', '-C', str(root), 'rev-parse', 'HEAD']),
-            'tracked': tracked, 'tracked_sha': sha256_text(tracked),
-            'porcelain': porcelain, 'porcelain_sha': sha256_text(porcelain)}
-
-
-def work_evidence(base, after=None):
-    """What the run actually produced, between two fingerprints.
-
-    {'commits': int|None, 'tracked_changed': bool, 'dirt_changed': bool,
-     'new_dirt': [porcelain lines], 'measurable': bool}. commits is None (and
-    measurable False) when the workspace is not a git tree or had no HEAD at
-    run start: 'we cannot see' must never be reported as 'the team did nothing'.
-    """
-    base = base or {}
-    after = after if after is not None else capture_workspace_state(
-        base.get('root') or '.')
-    known = set((base.get('porcelain') or '').splitlines())
-    return {'commits': _commits_since(base, after),
-            'tracked_changed': (base.get('tracked_sha') or '') !=
-                               (after.get('tracked_sha') or ''),
-            'dirt_changed': (base.get('porcelain_sha') or '') !=
-                            (after.get('porcelain_sha') or ''),
-            'new_dirt': [l for l in (after.get('porcelain') or '').splitlines()
-                         if l and l not in known],
-            'measurable': _commits_since(base, after) is not None}
-
-
-def _commits_since(base, after):
-    """`git rev-list --count <base head>..<after head>`; 0 when HEAD is the same;
-    None when either side is unknown (no git tree, unborn repo)."""
-    b, a = (base or {}).get('head') or '', (after or {}).get('head') or ''
-    if not b or not a:
-        return None
-    if b == a:
-        return 0
-    root = (after or {}).get('root') or (base or {}).get('root')
-    n = _git_out(['git', '-C', str(root), 'rev-list', '--count',
-                  '%s..%s' % (b, a)])
-    try:
-        return int(n)
-    except (TypeError, ValueError):
-        return None
-
-
-def _has_work(ev):
-    """Evidence says the run left something behind."""
-    if not ev or not ev.get('measurable'):
-        return True            # cannot prove zero work -> never claim abstention
-    return bool(ev.get('commits')) or ev.get('tracked_changed') or \
-        ev.get('dirt_changed')
-
-
-def produce_work(base, after=None):
-    """True when the run left evidence: new commits, a changed tracked diff, or
-    dirt that was not present at run start."""
-    return _has_work(work_evidence(base, after))
-
-
-def classify_outcome(status, base=None, after=None, ev=None):
-    """One of OUTCOMES for a finished (or refused, or crashed) run.
-
-    base/after are capture_workspace_state() dicts and `ev` is a precomputed
-    work_evidence(); `after` defaults to a fresh capture of base's root.
-    GATE_PASS / GATE_PASS_NEW -> success; GATE_PASS_TIE -> tie_kept (retained,
-    not proven better); BUDGET_REFUSED / DRY_PLAN -> refused (zero spend, kept
-    out of failure stats); GATE_FAIL / RUN_DONE_NO_GATE / ERROR -> partial_work
-    when there is work evidence, abstained when the run touched nothing.
-    Never raises; an unlisted status is treated as a failure, not a stall.
-    """
-    try:
-        if status in _OUTCOME_SUCCESS:
-            return 'success'
-        if status == 'GATE_PASS_TIE':
-            return 'tie_kept'
-        if status in _OUTCOME_REFUSED:
-            return 'refused'
-        if status in _OUTCOME_WORKED:
-            ev = ev if ev is not None else work_evidence(base, after)
-            return 'partial_work' if _has_work(ev) else 'abstained'
-        return 'partial_work'
-    except Exception:
-        return 'partial_work'
-
-
 def _spend_started(rec):
     """Did this run reach the `team_run` stage, where conv.run() can spend?
 
@@ -1016,17 +688,383 @@ def _emit_plan(run_dir, plan):
     sys.stdout.flush()
 
 
+# =========================================================== R5: THE FACADE
+# teamkit used to be a second engine: its own orchestrator prompt, its own
+# hardcoded lane policy, its own copy of the gate, and a router.yaml it never
+# consulted. R5 collapses that. run_team() keeps its signature and its
+# byte-compatible return keys, but execution now goes through
+# team.run_team.Team.run_workflow, which is the engine that has been validated
+# live end to end and now carries the grading discipline (post-run gate, pair
+# check against a run-start baseline, protected-path integrity, outcome split,
+# run records). What is left here is teamkit's own contract: the chokepoints, the
+# per-slug lock and record shape, the TDAI memory loop, the agent force-refresh,
+# and the caller-visible message.
+from team import run_team as engine          # noqa: E402
+from team.run_team import Task, Team, TeamError  # noqa: E402
+from router import Router                    # noqa: E402
+
+# Grading primitives now live in the engine; these re-exports keep every
+# `tk.<name>` reader working (tests, scripts, and the R1/R2 records API) while
+# there is exactly one implementation of each.
+GRADE_TIMEOUT = engine.GRADE_TIMEOUT
+OUTCOMES = engine.OUTCOMES if hasattr(engine, "OUTCOMES") else OUTCOMES
+run_slug = engine.run_slug
+git_workspace = engine.git_root
+capture_baseline_ref = engine.capture_baseline_ref
+materialize_baseline = engine.materialize_baseline
+run_gate = engine.run_gate
+norm_path = engine.norm_path
+covers_path = engine.covers_path
+changed_paths = engine.changed_paths
+protect_violations = engine.protect_violations
+evaluate_grade = engine.evaluate_grade
+grade_exit_code = engine.grade_exit_code
+
+
+def capture_workspace_state(workspace):
+    """Engine fingerprint, re-exported so the read-only guarantee has one home."""
+    return engine.capture_workspace_state(workspace)
+
+
+def work_evidence(base, after=None):
+    """Engine evidence with teamkit's `after` default (fresh capture of root)."""
+    if after is None:
+        after = engine.capture_workspace_state((base or {}).get("root") or ".")
+    return engine.work_evidence(base, after)
+
+
+def classify_outcome(status, base=None, after=None, ev=None):
+    """teamkit's signature over the engine's evidence-first classifier."""
+    if ev is None and not (base is None and after is None):
+        ev = work_evidence(base, after)
+    return engine.classify_outcome(status, ev)
+
+
+def _router() -> Router:
+    """The router this run resolves lanes through (TEAM_ROUTER_CONFIG honors)."""
+    return Router.load(os.environ.get("TEAM_ROUTER_CONFIG") or None)
+
+
+def _blocked_prefixes(r: Router) -> tuple:
+    """The declarative in-loop block list, with teamkit's tuple as backstop.
+
+    R5-D3: router.yaml `defaults.inloop_blocked_prefixes` is now the source. If
+    the key is missing (an older or hand-trimmed config), the historical tuple
+    still guards the route, because a silent loss of this check is a confirmed
+    empty-response killer.
+    """
+    try:
+        declared = r.inloop_blocked_prefixes()
+    except Exception:
+        declared = ()
+    return tuple(declared) or _INLOOP_BLOCKED_ON_ANTHROPIC
+
+
+def _lane_check(model, base_url, r=None):
+    """Return corrected (model, base_url) or raise before spending calls.
+
+    The block list comes from the router now; the openai/-prefix repair for the
+    compatible-mode endpoint is a property of that endpoint, not a policy, and
+    stays.
+    """
+    blocked = _blocked_prefixes(r or _router())
+    if TP_ANTH in base_url and any(b in model for b in blocked):
+        raise ValueError(
+            f"LANE GUARD: model '{model}' on anthropic route is a confirmed in-loop "
+            "empty-response killer; use compatible-mode base_url (openai/ prefix) or "
+            "a thinking-native model (qwen3.8-max) on anthropic. See openhands-sdk-pilot skill.")
+    if TP_COMPAT in base_url and not model.startswith('openai/'):
+        model = 'openai/' + model.split('/')[-1]
+    return model, base_url
+
+
+def _lane_kwargs(r: Router, role: str, model=None, base_url=None):
+    """Router lane kwargs with the caller's model/base_url override applied.
+
+    R5-D3: everything except the two overridden keys comes from the lane —
+    temperature, drop_params, retries, extra_body, capability_overrides — and the
+    credential is resolved against the lane's base URL by lib.keys, not by a
+    first-match regex over the owner's whole config file.
+    """
+    kwargs = dict(r.llm_kwargs(role))
+    if base_url:
+        kwargs["base_url"] = base_url
+    if model:
+        kwargs["model"] = model
+    return kwargs
+
+
+# ------------------------------------------------------- facade conversation
+class _KitRuntime(engine.TeamRuntime):
+    """teamkit's one Conversation, built inside the engine's accounting.
+
+    The engine still reserves and settles requests, still records them against
+    the lane, and still grades the result; what this runtime owns is the SDK
+    surface teamkit has always controlled: the agent force-refresh, the
+    builder/orchestrator system prompts, NeverConfirm, the stuck thresholds, and
+    the exact message text the caller's brief+contract+recall block produces.
+    """
+
+    def __init__(self, kit):
+        super().__init__()
+        self.kit = kit
+        self.strict_roles = False
+        self.propagate_task_errors = True
+
+    def load_defs(self, roles_dir):
+        """No RC1 role loading: teamkit registers its own definitions.
+
+        A builder run must not be refused because some md file in
+        team/roles parses hollow; teamkit's own preflight() applies the tool
+        asserts to AGENTS_DIR roles, which is where they belong.
+        """
+        return []
+
+    def preflight(self, team, iter_cap):
+        # The refresh already ran in the facade's `preflight` stage, so the
+        # config.json it records describes the registry the engine is about to
+        # use. Returning the same dict here keeps stage names truthful.
+        return self.kit.refreshed
+
+    def llm_kwargs(self, team, role):
+        return self.kit.llm_kwargs
+
+    def build_llm(self, team, kwargs):
+        return team.router.build_llm_from_kwargs(kwargs)
+
+    def prepare_task(self, team, task):
+        kit = self.kit
+        if kit.conv is not None:
+            raise RuntimeError("teamkit runtime built its conversation twice")
+        kit.build_conversation(team)
+        conv = kit.conv
+        if self.on_run:
+            self.on_run(str(team.workspace))
+        return conv, kit.llm, f"lane={kit.lane_name} model={kit.model}"
+
+
+def _builder_task(budget_calls, roles):
+    """The single task a facade run hands the engine (R5-D3 roles mapping)."""
+    if roles == 'none':
+        instruction = (
+            "You are a BUILDER agent: implement the brief yourself in your workspace, run the gate "
+            "command yourself, iterate until it passes. Hard budget: %d API calls. "
+            "Final message must be exactly one JSON object: "
+            "{\"status\":\"complete|partial\",\"files\":[...],\"evidence\":\"gate cmd + exit code\"}."
+            % int(budget_calls))
+        sub_agents = False
+    else:
+        instruction = (
+            "You are the ORCHESTRATOR (never write code; delegate via Task tool to 'architect' then 'fixer'). "
+            "Sub-agent handoffs: give each a self-contained task id, file scope, acceptance criteria; demand back "
+            "JSON only: {\"task\":\"...\",\"status\":\"done|blocked\",\"files\":[...],\"evidence\":\"file:line or cmd:exit\"}. "
+            "Hard budget: %d API calls total this run. When all contract items are implemented, STOP. "
+            "Final message must be exactly one JSON object: "
+            "{\"status\":\"complete|partial\",\"tasks_done\":[...],\"notes\":\"<=5 bullets\"}."
+            % int(budget_calls))
+        sub_agents = True
+    return Task(id="teamkit", role="fixer", instruction=instruction,
+                paths=(), acceptance=()), sub_agents
+
+
+class _Kit:
+    """Per-run state for the facade runtime: lane, refresh, conversation."""
+
+    #: The facade agent owns nothing in the workspace by name: its edits are
+    #: measured as work evidence, and only the engine's status files are exempt
+    #: from the protect check (they are written by contract, not by the brief).
+    EXEMPT = ()
+
+    def __init__(self, rec, roles, budget_calls, model, base_url, workspace):
+        self.rec = rec
+        self.roles = roles
+        self.budget_calls = budget_calls
+        self.workspace = workspace
+        self.requested_model = model
+        self.requested_base_url = base_url
+        self.conv = None
+        self.llm = None
+        self.refreshed = None
+        self.agent_warns = []
+        self.lane_name = None
+        self.model = model
+        self.base_url = base_url
+        self.llm_kwargs = {}
+
+    def resolve_lane(self, router):
+        """Lane first, then the caller's override, then the lane guard.
+
+        This is the whole of R5-D3: router.yaml decides the endpoint, the
+        retries, drop_params and capability overrides; `model=` may replace the
+        model id, and a `base_url=` may replace the endpoint, but the pair is
+        still checked against the lane policy before anything can spend.
+        """
+        role = "orchestrator" if self.roles != 'none' else "fixer"
+        lane = router.lane_for(role)
+        self.lane_name = lane.name
+        self.llm_kwargs = _lane_kwargs(router, role, model=self.requested_model,
+                                       base_url=self.requested_base_url)
+        self.model = self.llm_kwargs["model"]
+        self.base_url = self.llm_kwargs["base_url"]
+        self.model, self.base_url = _lane_check(self.model, self.base_url, router)
+        self.llm_kwargs["model"] = self.model
+        self.llm_kwargs["base_url"] = self.base_url
+        self.llm_kwargs["api_key"] = _key()
+        return role
+
+    def refresh(self, team, iter_cap):
+        """R4b-D7 force-refresh, unchanged in content, now inside the engine."""
+        if self.roles == 'none':
+            defs = []
+            refresh, warns = refresh_workspace_agents(self.workspace,
+                                                      cap=iter_cap)
+        else:
+            defs = preflight()
+            refresh, warns = refresh_workspace_agents(
+                self.workspace, defs=list(defs) + _workspace_defs(self.workspace),
+                cap=iter_cap)
+        self.agent_warns = warns
+        self.refreshed = {"registered": refresh['names'],
+                          "normalized": refresh['normalized'],
+                          "caps": refresh['caps'],
+                          "builder_mode": self.roles == 'none',
+                          "iter_cap": iter_cap}
+        self._register_orchestrator_defs(defs)
+        return self.refreshed
+
+    def _register_orchestrator_defs(self, defs):
+        """Keep the orchestrator's explicit registration contract exactly as R4b.
+
+        refresh_workspace_agents() has already registered the normalized,
+        cap-clamped objects plus the workspace's own file agents; this loop
+        repeats the AGENTS_DIR registration (pop + register + the
+        general-purpose alias) so alias handling and the recorded `agents`
+        summary describe the same set of names.
+        """
+        from openhands.sdk.subagent import (agent_definition_to_factory,
+                                            register_agent_if_absent)
+        from openhands.sdk.subagent.registry import _agent_factories, _registry_lock
+        for d in defs:
+            with _registry_lock:
+                _agent_factories.pop(d.name, None)
+            register_agent_if_absent(d.name,
+                                     agent_definition_to_factory(d, self.workspace),
+                                     d)
+        if 'general-purpose' not in _agent_factories and 'fixer' in _agent_factories:
+            gf = _agent_factories['fixer']
+            register_agent_if_absent('general-purpose', gf.factory_func, gf.definition)
+
+    def build_conversation(self, team):
+        """The one Conversation teamkit has always run: same ctor kwargs.
+
+        R5 removed the task-tool dependency: the work happens in this
+        conversation and, for a workflow run, in the engine's per-role
+        conversations. Nothing here spawns an orchestrator that then re-delegates
+        the whole plan (docs/DELEGATION-INCIDENT.md closed that design).
+        """
+        from openhands.sdk import Agent, Conversation
+        from openhands.tools.preset.default import get_default_tools
+        from openhands.sdk.security.confirmation_policy import NeverConfirm
+
+        self.llm = team.runtime.build_llm(team, self.llm_kwargs)
+        task, sub_agents = _builder_task(self.budget_calls, self.roles)
+        tools = get_default_tools(enable_browser=False, enable_sub_agents=sub_agents)
+        agent = Agent(llm=self.llm, tools=tools, system_prompt=task.instruction)
+        conv = Conversation(agent=agent, workspace=self.workspace,
+                            max_iteration_per_run=self.refreshed['iter_cap'],
+                            stuck_detection_thresholds={
+                                "action_observation": 6, "action_error": 6,
+                                "monologue": 8, "alternating_pattern": 6})
+        if self.roles == 'none':
+            # v1.54: policy is setter-only, never a ctor kwarg
+            conv.set_confirmation_policy(NeverConfirm())
+        self.conv = conv
+        team.runtime.conversations.append(conv)
+
+    def message_for(self, brief, spec, contract, recall_info):
+        """The caller's exact text: brief|spec + contract + PRIOR LEARNINGS."""
+        msg = (brief if brief else spec) or ""
+        if contract:
+            msg += "\n\nDELIVERABLE CONTRACT (verify each): " + json.dumps(
+                contract, ensure_ascii=False)
+        # The hub call already happened (once per run) and its attribution is in
+        # config.json; R4-D4 matters because this text is appended AFTER brief
+        # hashing, so the record alone could not otherwise say what memory added.
+        msg += _recall_block('', recall_info)[0]
+        return msg
+
+
+def _m0(model):
+    return str(model or '').startswith('openai/')
+
+
+def _recall_summary(recall):
+    """R4b-D6: the config.json `recall` key, from a _recall_info() dict.
+
+    {recall_status: fired|empty|unavailable|error, hits: [{name|sha8, chars}]}.
+    `unavailable` (no key / no bridge) is recorded explicitly rather than being
+    absent: "memory said nothing" and "memory was never reachable" have to stay
+    distinguishable in the record, which is the entire point of the status.
+    Keys of the info dict are the contract (RECALL_STATUSES), so this is a
+    projection, not a re-derivation.
+    """
+    if not recall:
+        return None
+    return {'recall_status': recall.get('recall_status'),
+            'hits': [{'name': h['name'], 'chars': h.get('chars', 0)}
+                     if 'name' in h else
+                     {'sha8': h.get('sha8', ''), 'chars': h.get('chars', 0)}
+                     for h in recall.get('recall_hits') or []]}
+
+
+def _record_config(ws, model, base_url, budget_calls, contract, roles, brief,
+                   spec, run_dir=None, recall=None, agents=None,
+                   task_start_ts=None, engine_block=None):
+    """config.json payload: resolved inputs + sha256 of the brief text (never
+    the text itself) + the contract verbatim + R4-D4 recall attribution.
+
+    `recall` is the _recall_info() dict. Flat `recall_status`/`recall_hits` are
+    kept for every reader that landed before R4b; R4b-D6 adds the nested
+    `recall` summary, which is the shape the acceptance contract names.
+    `agents` is R4b-D7's registration summary (registered names, normalized
+    model values, per-role caps, agent warnings); recorded only when a refresh
+    actually ran. `task_start_ts` (R4b-D8) is the value exported to
+    $TASK_START_TS for every child process, so the record and the tester's
+    ledger window can be reconciled. `engine` (R5) names the engine that actually
+    ran the work, so a record says which path produced it.
+    """
+    msg_text = (brief if brief else spec) or ''
+    cfg = {"run_dir": run_dir, "workspace": ws, "model": model,
+           "base_url": base_url, "budget_calls": budget_calls,
+           "contract": contract, "roles": roles,
+           "brief_sha256": sha256_text(msg_text)}
+    if task_start_ts is not None:
+        cfg['task_start_ts'] = task_start_ts
+    if recall:
+        cfg['recall_status'] = recall.get('recall_status')
+        cfg['recall_hits'] = recall.get('recall_hits') or []
+        cfg['recall'] = _recall_summary(recall)
+        if recall.get('recall_error'):
+            cfg['recall_error'] = recall['recall_error']
+    if agents:
+        cfg['agents'] = agents
+    if engine_block:
+        cfg['engine'] = engine_block
+    return cfg
+
+
 def run_team(brief=None, spec=None, workspace='.', budget_calls=80, contract=None,
              model="openai/qwen3.8-flash", base_url=None, roles=None,
              lessons=None, waive_lessons=None, max_empty_responses=3,
              on_run=None):
-    """Run the team, then grade it — with a run record and a budget guard.
+    """Run the team through THE engine, then grade it — record, lock, guard.
 
-    Pre-existing behaviour is unchanged; wrapped around it: D3 chokepoints first
-    (BUDGET_REFUSED / DRY_PLAN, both before preflight), then the per-slug lock,
-    then the run itself under stage recording. Returns the legacy keys plus
-    `run_dir`, `pair`, `outcome` and `work_evidence` (D4). `on_run` is a test
-    seam, called where conv.run() edits.
+    R5 collapse: same signature, same returned keys, same chokepoints; the work
+    is `Team.run_workflow()`. Order is unchanged because each step's position is
+    a rule: D3 refusal before anything exists, the per-slug lock before any API
+    call, the read-only fingerprint before the team touches the workspace, the
+    baseline ref only when a pair check will use it, then the engine, then the
+    lessons gate, then the record.
     """
     # ---- D3 chokepoint: refuse / plan BEFORE preflight, before any spend.
     try:
@@ -1037,36 +1075,8 @@ def run_team(brief=None, spec=None, workspace='.', budget_calls=80, contract=Non
         return _refused(budget_calls)
     rec = _rec()
     if os.environ.get('TEAMKIT_DRY_RUN') == '1':
-        _ws = os.path.abspath(workspace or '.')
-        _m, _u = _lane_check(model, base_url or
-                             (TP_COMPAT if _m0(model) else TP_ANTH))
-        plan = {"workspace": _ws, "model": _m, "base_url": _u,
-                "budget_calls": _b, "roles": roles, "stages": list(STAGES),
-                "gate": (contract or {}).get('gate'),
-                "incumbent_gate": (contract or {}).get('incumbent_gate')}
-        run_dir, cfg = None, None
-        try:
-            rec = start_recording(_ws)
-            cfg = _record_config(_ws, _m, _u, budget_calls, contract, roles,
-                                 brief, spec, rec.run_dir)
-            record_config(rec, cfg)
-            rec.recorder.state({s: {'status': 'skipped', 'attempts': 0}
-                                for s in STAGES})
-            run_dir = rec.run_dir
-        except Exception:
-            run_dir = None
-        release_run_lock(rec)
-        plan['config'] = cfg
-        _emit_plan(run_dir, plan)
-        return {"status": "DRY_PLAN", "gate": None, "gate_tail": "",
-                "lessons": None, "workdir_diff": "", "recent_commits": "",
-                "orchestrator_final": "", "run_dir": run_dir, "pair": None,
-                "outcome": "refused",
-                "plan": {"workspace": _ws, "model": _m, "base_url": _u,
-                         "budget_calls": _b, "roles": roles,
-                         "stages": list(STAGES),
-                         "gate": (contract or {}).get('gate'),
-                         "incumbent_gate": (contract or {}).get('incumbent_gate')}}
+        return _dry_plan(rec, _b, workspace, model, base_url, contract, roles,
+                         brief, spec)
 
     # ---- D1: one lock per run slug, taken BEFORE any API call can be spent.
     rec = start_recording(os.path.abspath(workspace or '.'))
@@ -1088,7 +1098,7 @@ def run_team(brief=None, spec=None, workspace='.', budget_calls=80, contract=Non
             rec.baseline_ref = None
     try:
         # config.json up front, so the record survives even a stage that raises.
-        # _run_team_inner rewrites it once lane_check resolved model/base_url.
+        # _run_team_inner rewrites it once the lane is resolved.
         record_config(rec, _record_config(
             os.path.abspath(workspace or '.'), model,
             base_url or (TP_COMPAT if _m0(model) else TP_ANTH),
@@ -1126,219 +1136,147 @@ def run_team(brief=None, spec=None, workspace='.', budget_calls=80, contract=Non
         release_run_lock(rec)
 
 
-def _m0(model):
-    return str(model or '').startswith('openai/')
+def _dry_plan(rec, budget, workspace, model, base_url, contract, roles, brief,
+              spec):
+    """TEAMKIT_DRY_RUN=1 -> DRY_PLAN with a router-resolved lane, zero calls.
 
-
-def _recall_summary(recall):
-    """R4b-D6: the config.json `recall` key, from a _recall_info() dict.
-
-    {recall_status: fired|empty|unavailable|error, hits: [{name|sha8, chars}]}.
-    `unavailable` (no key / no bridge) is recorded explicitly rather than being
-    absent: "memory said nothing" and "memory was never reachable" have to stay
-    distinguishable in the record, which is the entire point of the status.
-    Keys of the info dict are the contract (RECALL_STATUSES), so this is a
-    projection, not a re-derivation.
+    R5-D3: the plan now prints what router.yaml would actually use, because the
+    config is authoritative for the lane; `model=`/`base_url=` still override.
     """
-    if not recall:
-        return None
-    return {'recall_status': recall.get('recall_status'),
-            'hits': [{'name': h['name'], 'chars': h.get('chars', 0)}
-                     if 'name' in h else
-                     {'sha8': h.get('sha8', ''), 'chars': h.get('chars', 0)}
-                     for h in recall.get('recall_hits') or []]}
-
-
-def _record_config(ws, model, base_url, budget_calls, contract, roles, brief,
-                   spec, run_dir=None, recall=None, agents=None,
-                   task_start_ts=None):
-    """config.json payload: resolved inputs + sha256 of the brief text (never
-    the text itself) + the contract verbatim + R4-D4 recall attribution.
-
-    `recall` is the _recall_info() dict. Flat `recall_status`/`recall_hits` are
-    kept for every reader that landed before R4b; R4b-D6 adds the nested
-    `recall` summary, which is the shape the acceptance contract names.
-    `agents` is R4b-D7's registration summary (registered names, normalized
-    model values, per-role caps, agent warnings); recorded only when a refresh
-    actually ran. `task_start_ts` (R4b-D8) is the value exported to
-    $TASK_START_TS for every child process, so the record and the tester's
-    ledger window can be reconciled.
-    """
-    msg_text = (brief if brief else spec) or ''
-    cfg = {"run_dir": run_dir, "workspace": ws, "model": model,
-           "base_url": base_url, "budget_calls": budget_calls,
-           "contract": contract, "roles": roles,
-           "brief_sha256": sha256_text(msg_text)}
-    if task_start_ts is not None:
-        cfg['task_start_ts'] = task_start_ts
-    if recall:
-        cfg['recall_status'] = recall.get('recall_status')
-        cfg['recall_hits'] = recall.get('recall_hits') or []
-        cfg['recall'] = _recall_summary(recall)
-        if recall.get('recall_error'):
-            cfg['recall_error'] = recall['recall_error']
-    if agents:
-        cfg['agents'] = agents
-    return cfg
+    ws = os.path.abspath(workspace or '.')
+    r = _router()
+    kit = _Kit(rec, roles, budget, model, base_url, ws)
+    kit.resolve_lane(r)
+    plan = {"workspace": ws, "model": kit.model, "base_url": kit.base_url,
+            "budget_calls": budget, "roles": roles, "stages": list(STAGES),
+            "gate": (contract or {}).get('gate'),
+            "incumbent_gate": (contract or {}).get('incumbent_gate'),
+            "lane": kit.lane_name}
+    run_dir, cfg = None, None
+    try:
+        rec = start_recording(ws)
+        cfg = _record_config(ws, kit.model, kit.base_url, budget, contract,
+                             roles, brief, spec, rec.run_dir,
+                             engine_block={"name": "run_team.Team",
+                                           "mode": "dry_plan",
+                                           "lane": kit.lane_name})
+        record_config(rec, cfg)
+        rec.recorder.state({s: {'status': 'skipped', 'attempts': 0}
+                            for s in STAGES})
+        run_dir = rec.run_dir
+    except Exception:
+        run_dir = None
+    release_run_lock(rec)
+    plan['config'] = cfg
+    _emit_plan(run_dir, plan)
+    return {"status": "DRY_PLAN", "gate": None, "gate_tail": "",
+            "lessons": None, "workdir_diff": "", "recent_commits": "",
+            "orchestrator_final": "", "run_dir": run_dir, "pair": None,
+            "outcome": "refused",
+            "plan": {"workspace": ws, "model": kit.model, "base_url": kit.base_url,
+                     "budget_calls": budget, "roles": roles,
+                     "stages": list(STAGES),
+                     "gate": (contract or {}).get('gate'),
+                     "incumbent_gate": (contract or {}).get('incumbent_gate')}}
 
 
 def _run_team_inner(rec, brief, spec, workspace, budget_calls, contract, model,
                     base_url, roles, lessons, waive_lessons,
                     max_empty_responses, on_run=None):
-    """The original run_team() body, stage-recorded by the run_team() wrapper.
+    """Facade body: resolve the lane, hand the run to the engine, grade the rest.
 
-    Every pre-existing step stays in order (preflight -> lane check -> register
-    agents -> send_message/run -> gate -> lessons -> git diff/log -> return);
-    only stage bookkeeping and the gate evaluation are wrapped. `on_run` exists
-    for tests: it is called at the point conv.run() would have mutated the
-    workspace, so "baseline captured at run start" can be proven deterministically.
+    The stages keep their R1 names so state.json is comparable across the whole
+    history of these records: `preflight` is the lane resolution + agent
+    force-refresh, `team_run` is the engine's workflow, `gate` is the engine's
+    grading stage, `lessons` is the R4 seed policy below.
     """
+    ws = os.path.abspath(workspace or '.')
     stage_start(rec, 'preflight')
     try:
         # R4b-D8: team/roles/tester.md reads $TASK_START_TS to bound its ledger
-        # delta to THIS run; nothing set it, so the window was always "the whole
-        # session". Exported before any subprocess exists (gate, agent terminal,
-        # the tester one-liner) and recorded so the record says what the children
-        # were given.
+        # delta to THIS run. Exported before any subprocess exists (gate, agent
+        # terminal, the tester one-liner) and recorded so the record says what
+        # the children were given.
         task_start_ts = int(time.time())
         os.environ['TASK_START_TS'] = str(task_start_ts)
-        # R4b-D7b: the run budget bounds whatever a role file declares.
-        iter_cap = max(1, int(budget_calls) * 3)
-        # R4b-D7a: BOTH modes force-refresh. Orchestrator mode starts from the
-        # AGENTS_DIR roles preflight() parsed and adds this workspace's own file
-        # agents; builder mode starts from the workspace files alone (it has no
-        # AGENTS_DIR roles, since nothing delegates). refresh_workspace_agents
-        # pops each name out of `_agent_factories` and re-registers it from the
-        # CURRENT disk file, which is the only way an already-registered name
-        # picks up an edit (the SDK uses register_agent_if_absent: absent-only).
-        # `defs` below stays the AGENTS_DIR list so the orchestrator's
-        # registration loop and the general-purpose alias behave exactly before.
-        if roles == 'none':
-            defs = []
-            refresh, agent_warns = refresh_workspace_agents(workspace,
-                                                            cap=iter_cap)
-        else:
-            defs = preflight()
-            refresh, agent_warns = refresh_workspace_agents(
-                workspace, defs=list(defs) + _workspace_defs(workspace),
-                cap=iter_cap)
-        agents_summary = {"registered": refresh['names'],
-                          "normalized": refresh['normalized'],
-                          "caps": refresh['caps'],
-                          "builder_mode": roles == 'none',
-                          "iter_cap": iter_cap}
-        if agent_warns:
-            agents_summary["warnings"] = agent_warns
+        r = _router()
+        kit = _Kit(rec, roles, budget_calls, model, base_url, ws)
+        role = kit.resolve_lane(r)
+        # R4b-D7a/b: the run budget bounds whatever a role file declares, and the
+        # force-refresh runs in THIS stage so config.json can record it before
+        # anything spends. A preflight blowup therefore stays a zero-spend
+        # refusal, exactly as R1 defined it.
+        kit.iter_cap = max(1, int(budget_calls) * 3)
+        kit.refresh(None, kit.iter_cap)
     except Exception as exc:
         stage_end(rec, 'preflight', 'fail', exc)
         raise
-    stage_end(rec, 'preflight', 'done')
-    # `defs` deliberately stays the AGENTS_DIR list: refresh_workspace_agents()
-    # has already registered those (normalized, cap-clamped) objects plus the
-    # workspace's own file agents, and the loop below repeats the AGENTS_DIR
-    # registration exactly as it did before, so the orchestrator's alias handling
-    # and the run's recorded `agents` summary describe the same set of names.
-    from openhands.sdk import LLM, Agent, Conversation
-    from openhands.tools.preset.default import get_default_tools
-    from openhands.sdk.security.confirmation_policy import NeverConfirm
-    from openhands.sdk.subagent import register_agent_if_absent, agent_definition_to_factory
-
-    base_url = base_url or (TP_COMPAT if model.startswith('openai/') else TP_ANTH)
-    model, base_url = _lane_check(model, base_url)
     # TDAI read path, run BEFORE the config record is written so attribution
     # lands in config.json (R4-D4). One hub read per run: the same dict feeds both
     # the record and the PRIOR LEARNINGS block appended to the message below.
     recall_info = _recall_info(_tdai(), os.path.basename(str(workspace).rstrip('/'))
                                + ' ' + (brief or spec or '')[:400])
     record_recall(rec, recall_info)      # so summary.json carries it too (D6)
-    record_config(rec, _record_config(os.path.abspath(workspace or '.'), model,
-                                      base_url, budget_calls, contract, roles,
-                                      brief, spec, rec.run_dir,
-                                      recall=recall_info, agents=agents_summary,
-                                      task_start_ts=task_start_ts))
-    llm = LLM(model=model, api_key=_key(), base_url=base_url)
-    # NOTE (R4b-D7): the registration below is NOT the force-refresh. That
-    # already happened inside refresh_workspace_agents() at the top of this
-    # function, for BOTH modes, with the model normalization and the cap clamp
-    # applied to the in-memory definitions. What remains here keeps the
-    # orchestrator's explicit registration contract for the AGENTS_DIR roles
-    # (pop + register + the general-purpose alias) using those same refreshed
-    # definition objects, so the registry can never hold a pre-normalization or
-    # pre-clamp copy of a role.
-    from openhands.sdk.subagent.registry import _agent_factories, _registry_lock
-    for d in defs:
-        # force-refresh: drop any stale registration from a previous run so the
-        # CURRENT md file on disk is what actually executes (silent-drift trap)
-        with _registry_lock:
-            _agent_factories.pop(d.name, None)
-        # description is the DEFINITION object, never a bare string: a string
-        # becomes a metadata-empty AgentDefinition inside the SDK, and that is
-        # where the Task manager reads max_iteration_per_run and
-        # permission_mode from (R4b-D7b).
-        register_agent_if_absent(d.name, agent_definition_to_factory(d, workspace), d)
-    # Task tool defaults subagent_type='general-purpose'; without it registered,
-    # any such call dies with 'Unknown agent'. Map it to fixer as a safe alias.
-    if 'general-purpose' not in _agent_factories and 'fixer' in _agent_factories:
-        gf = _agent_factories['fixer']
-        register_agent_if_absent('general-purpose', gf.factory_func, gf.definition)
+    record_config(rec, _record_config(ws, kit.model, kit.base_url, budget_calls,
+                                      contract, roles, brief, spec, rec.run_dir,
+                                      recall=recall_info,
+                                      agents=kit.refreshed,
+                                      task_start_ts=task_start_ts,
+                                      engine_block={"name": "run_team.Team",
+                                                    "mode": ("builder" if roles == 'none'
+                                                             else "single_conversation"),
+                                                    "role": role,
+                                                    "lane": kit.lane_name,
+                                                    "api_key_source": "lib.keys"}))
+    stage_end(rec, 'preflight', 'done')
 
-    # JSON-only handoff contract between orchestrator and its sub-agents
-    if roles == 'none':
-        sys_prompt = (
-            "You are a BUILDER agent: implement the brief yourself in your workspace, run the gate "
-            f"command yourself, iterate until it passes. Hard budget: {budget_calls} API calls. "
-            "Final message must be exactly one JSON object: "
-            "{\"status\":\"complete|partial\",\"files\":[...],\"evidence\":\"gate cmd + exit code\"}."
-        )
-        tools = get_default_tools(enable_browser=False, enable_sub_agents=False)
-    else:
-        sys_prompt = (
-            "You are the ORCHESTRATOR (never write code; delegate via Task tool to 'architect' then 'fixer'). "
-            "Sub-agent handoffs: give each a self-contained task id, file scope, acceptance criteria; demand back "
-            "JSON only: {\"task\":\"...\",\"status\":\"done|blocked\",\"files\":[...],\"evidence\":\"file:line or cmd:exit\"}. "
-            f"Hard budget: {budget_calls} API calls total this run. When all contract items are implemented, STOP. "
-            "Final message must be exactly one JSON object: "
-            "{\"status\":\"complete|partial\",\"tasks_done\":[...],\"notes\":\"<=5 bullets\"}."
-        )
-        tools = get_default_tools(enable_browser=False, enable_sub_agents=True)
-    agent = Agent(llm=llm, tools=tools, system_prompt=sys_prompt)
-    # R4b-D7b: `iter_cap` is exactly the old budget_calls * 3, hoisted into the
-    # preflight block because the same number must bound every per-role
-    # definition cap; min(def, iter_cap) lands on the definition objects above
-    # and this Conversation is the parent they inherit from.
-    conv = Conversation(agent=agent, workspace=workspace, max_iteration_per_run=iter_cap,
-                        stuck_detection_thresholds={"action_observation": 6, "action_error": 6,
-                                                    "monologue": 8, "alternating_pattern": 6})
-    if roles == 'none':
-        conv.set_confirmation_policy(NeverConfirm())  # v1.54: policy is setter-only, never ctor kwarg
-    msg = (brief if brief else spec) or ""
-    if contract:
-        msg += "\n\nDELIVERABLE CONTRACT (verify each): " + json.dumps(contract, ensure_ascii=False)
-    # TDAI read path: shared team memory recall appended when a key is present.
-    # The hub call already happened above (once per run), and its attribution is
-    # in config.json; R4-D4 matters because this text is appended AFTER brief
-    # hashing, so the record alone could not otherwise say what memory added.
-    msg += _recall_block('', recall_info)[0]
-    conv.send_message(msg)
-    # iteration cap + tightened stuck thresholds are set at Conversation ctor
-    # above; run() itself takes no args in v1.54
+    task, _sub = _builder_task(budget_calls, roles)
+    runtime = _KitRuntime(kit)
+    # R4b-D7b: the conversation cap is exactly the old budget_calls * 3, and the
+    # same number bounds every per-role definition cap the refresh clamped.
+    runtime.iter_cap = kit.iter_cap
+    runtime.direct_task = task
+    runtime.message_override = kit.message_for(brief, spec, contract, recall_info)
+    runtime.on_run = on_run
+    runtime.api_key_source = "lib.keys"
+    runtime.declared_paths = list(_Kit.EXEMPT)
+    ceiling = min(int(budget_calls),
+                  int(r.budget.get("max_requests_per_team_run", 100)))
+    team = Team(ws, router=r, contract=contract, grade=True, runtime=runtime,
+                max_requests=ceiling, record=False)
+
     stage_start(rec, 'team_run')
     try:
-        # test seam: on_run fires where the team is about to edit the workspace,
-        # i.e. still inside the run and before the gate is graded
-        if on_run:
-            on_run(workspace)
-        conv.run()
+        report = team.run_workflow(brief or ws)
     except Exception as exc:
-        _capture_workcheck(rec, workspace)
+        rec.workcheck = getattr(team, 'after_team', None) or \
+            capture_workspace_state(ws)
         stage_end(rec, 'team_run', 'fail', exc)
         raise
-    _capture_workcheck(rec, workspace)
+    rec.workcheck = team.after_team
     stage_end(rec, 'team_run', 'done')
 
-    # deterministic grading: component check (+ pair check vs incumbent) and git
-    # state — NOT orchestrator prose
-    status, gate_ok, gate_out, pair = evaluate_gate(rec, contract, workspace)
+    # The engine ran the gate and the pair check; mirror its verdict into this
+    # run's stage ledger and write retained.json for a v2 run (R1 semantics).
+    stage_start(rec, 'gate')
+    gate_status = report.get('status')
+    if not (contract or {}).get('gate'):
+        # R1 semantics kept: a run with no gate command skipped the stage rather
+        # than failing it. A protect violation can still fail the STATUS; the
+        # stage says there was nothing to run.
+        stage_end(rec, 'gate', 'skipped')
+    else:
+        accepted = gate_status in ('GATE_PASS', 'GATE_PASS_NEW', 'GATE_PASS_TIE')
+        stage_end(rec, 'gate', 'done' if accepted else 'fail',
+                  None if accepted else RuntimeError(
+                      str(report.get('gate_tail') or '')[-300:]))
+    if report.get('pair') is not None:
+        try:
+            rec.recorder.retained({k: v for k, v in (report.get('retained') or
+                                                     {}).items()})
+        except Exception:
+            pass
+    rec.pair = report.get('pair')
 
     # lessons gate (owner rule 2026-10-11): every run must end with seeded
     # learnings or an explicit waiver.
@@ -1350,7 +1288,8 @@ def _run_team_inner(rec, brief, spec, workspace, budget_calls, contract, model,
     # over is `partial`, never a silently-done stage.
     # A keyless or hub-down bridge is the documented no-op path (hard
     # constraint: behaves exactly as today), so `unavailable` is NOT partial.
-    outcome = _outcome_for(rec, status, _work_evidence_for(rec))
+    outcome = classify_outcome(gate_status, ev=work_evidence(rec.baseline,
+                                                             rec.workcheck))
     seedable = outcome in SEEDABLE_OUTCOMES
     explicit_waiver = isinstance(lessons, list) and not lessons
     stage_start(rec, 'lessons')
@@ -1380,15 +1319,17 @@ def _run_team_inner(rec, brief, spec, workspace, budget_calls, contract, model,
 
     diff = subprocess.run(['git', '-C', workspace, 'diff', '--stat'], capture_output=True, text=True)
     committed = subprocess.run(['git', '-C', workspace, 'log', '--oneline', '-5'], capture_output=True, text=True)
+    conv = kit.conv or (team.runtime.conversations[-1]
+                        if team.runtime.conversations else None)
     return {
-        "status": status,
-        "gate": contract.get('gate') if contract else None,
-        "gate_tail": gate_out,
+        "status": gate_status,
+        "gate": (contract or {}).get('gate'),
+        "gate_tail": report.get('gate_tail', ""),
         "lessons": lesson_status,
-        "workdir_diff": diff.stdout[-1200:],
+        "workdir_diff": (diff.stdout or '')[-1200:],
         "recent_commits": committed.stdout,
         "orchestrator_final": (getattr(conv, 'state', None) and str(conv.state)[-400:]) or '',
-        "pair": pair,
+        "pair": report.get('pair'),
         # R4-D4: handed to run_team(), which merges it into config.json and pops
         # so the returned dict keeps its documented key set.
         "_recall_info": recall_info,
