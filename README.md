@@ -90,7 +90,7 @@ $V team/run_team.py --brief BRIEF.md --workspace REPO --gate "pytest -q tests/" 
     --incumbent-gate "pytest -q tests/" --protect tests/    # graded run
 ```
 
-Grading is the same on both entry points: the CLI passes `--gate/--incumbent-gate/--protect`, `run_team()` passes `contract={"gate": cmd, "incumbent_gate": cmd, "protect": [paths]}`. Over-budget calls are refused before spend; `TEAMKIT_DRY_RUN=1` plans free. Every graded run persists a record under `runs/<ts>-<slug>/`, written by whichever entry point ran it.
+Grading is the same on both entry points: the CLI passes `--gate/--incumbent-gate/--protect`, `run_team()` passes `contract={"gate": cmd, "incumbent_gate": cmd, "protect": [paths]}`. Over-budget calls are refused before spend. `TEAMKIT_DRY_RUN=1` plans free. Every graded run persists a record under `runs/<ts>-<slug>/`, written by whichever entry point ran it.
 
 `run_team()` exports `TASK_START_TS=<run-start epoch>` before launching anything, so the gate and every agent subprocess share one window and `team/roles/tester.md` can report spend *since this run started* instead of since the session began; the value is recorded as `task_start_ts` in `config.json`. `config.json` also carries `recall` (`{recall_status: fired|empty|unavailable|error, hits: [{name|sha8, chars}]}`): attribution for the memory block appended to the brief, with `unavailable` recorded explicitly rather than left as silence. And `agents`: which file agents were force-refreshed into the registry, their effective iteration caps (`min(declared, budget_calls*3)`), and any `model:` value healed to `inherit`.
 
