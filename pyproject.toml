@@ -9,17 +9,21 @@ description = "Robust multi-agent dev stack on existing Token Plan (main) + Kimi
 requires-python = ">=3.11"
 # Runtime deps are the ones already present in the shared venv
 # (/home/hermes/.hermes/cache/scratch/oh-venv). Nothing here installs anything:
-# openhands-sdk==1.51.0 / openhands-tools==1.51.0 / litellm==1.104.0 / PyYAML /
-# pytest / jsonschema are all preinstalled, and a version-skewed SDK+tools pair
-# breaks imports, so the pins below are documentation, not a request to pip.
+# openhands-sdk / openhands-tools / litellm / PyYAML / pytest / jsonschema are
+# all preinstalled, and a version-skewed SDK+tools pair breaks imports, so the
+# pins below are documentation, not a request to pip.
+# R5: the documented floor moved from 1.51 to 1.54 because that is the version
+# the code is written against: Conversation(stuck_detection_thresholds=...),
+# setter-only NeverConfirm, and run() taking no args are 1.54 APIs, and a pin
+# naming 1.51 claimed support for an SDK this stack cannot run on.
 dependencies = [
     "PyYAML>=6",
 ]
 
 [project.optional-dependencies]
 team = [
-    "openhands-sdk==1.51.0",
-    "openhands-tools==1.51.0",
+    "openhands-sdk>=1.54,<2",
+    "openhands-tools>=1.54,<2",
     "litellm>=1.104,<2",
 ]
 dev = [

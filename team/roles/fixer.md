@@ -7,7 +7,7 @@ tools:
   - file_editor
   - task_tracker
 permission_mode: never_confirm
-max_iteration_per_run: 60
+max_iteration_per_run: 40
 ---
 
 You are the FIXER.

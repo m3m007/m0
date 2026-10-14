@@ -113,13 +113,33 @@ EXPECTED_TASKS = [
 ]
 
 
+#: The live smoke grades through the unified engine's contract. The incumbent
+#: gate is the same command run against the run-start baseline, which in this
+#: repo is the KNOWN-BROKEN state: so a genuine fix lands GATE_PASS_NEW, and a
+#: run that merely made the suite green where it already was green cannot hide.
+SMOKE_CONTRACT = {"gate": "python3 -m pytest -q",
+                  "incumbent_gate": "python3 -m pytest -q"}
+PASS_FAMILY = ("GATE_PASS", "GATE_PASS_NEW", "GATE_PASS_TIE")
+
+
 def fresh_workspace(tmp_path: Path) -> Path:
-    """Copy the smoke repo so every run starts from the same known-broken state."""
+    """Copy the smoke repo so every run starts from the same known-broken state.
+
+    R5 adds a real git repo around the copy: the grading stage measures work and
+    materializes the pair-check baseline from commits, so a workspace without one
+    would grade as unmeasurable. The baseline commit is the broken state, which is
+    exactly the incumbent the pair check is supposed to lose to.
+    """
     ws = tmp_path / "smoke"
     if ws.exists():
         shutil.rmtree(ws)
     shutil.copytree(SMOKE_SRC, ws, ignore=shutil.ignore_patterns("__pycache__",
-                                                                "*.pyc"))
+                                                                "*.pyc", ".git"))
+    git = ["git", "-c", "user.email=smoke@test", "-c", "user.name=smoke"]
+    subprocess.run(git + ["init", "-q", "."], cwd=str(ws), check=True)
+    subprocess.run(git + ["add", "-A"], cwd=str(ws), check=True)
+    subprocess.run(git + ["commit", "-qm", "broken baseline"], cwd=str(ws),
+                   check=True)
     return ws
 
 
@@ -171,6 +191,7 @@ def test_offline_dependency_wave_is_two_rounds():
 # ---------------------------------------------------------------- live
 @pytest.mark.skipif(not LIVE, reason="set SMOKE_LIVE=1 to spend real requests")
 def test_live_team_workflow_fixes_the_repo(tmp_path):
+    """The required live validation: the UNIFIED engine, graded end to end."""
     ws = fresh_workspace(tmp_path)
     ceiling = ceiling_from_router()
     before_ledger = total()
@@ -181,7 +202,7 @@ def test_live_team_workflow_fixes_the_repo(tmp_path):
     assert "ok" not in (pre["durations"], pre["normalise"]), \
         f"smoke repo should start broken, got {pre}"
 
-    team = Team(ws, max_requests=min(ceiling, 80))
+    team = Team(ws, max_requests=min(ceiling, 80), contract=SMOKE_CONTRACT)
     report = team.run_workflow(ws / "BRIEF.md")
     spent = total() - before_ledger
 
@@ -210,6 +231,14 @@ def test_live_team_workflow_fixes_the_repo(tmp_path):
     assert post["durations"] == "ok", f"durations gate: {post['durations']}"
     assert post["normalise"] == "ok", f"normalise gate: {post['normalise']}"
     assert post["whole"] == "ok", f"whole suite: {post['whole']}"
+
+    # R5: the graded verdict, from the engine's own post-workflow stage
+    assert report.get("graded") is True, "the unified path must grade"
+    assert report.get("status") in PASS_FAMILY, \
+        f"expected a GATE_PASS-family verdict, got {report.get('status')}"
+    assert report.get("outcome") in ("success", "tie_kept"), report.get("outcome")
+    assert report.get("run_dir") and Path(report["run_dir"]).is_dir()
+    assert report.get("work_evidence"), "evidence must be measured, not asserted"
 
     assert spent <= ceiling, f"smoke run spent {spent}, ceiling is {ceiling}"
     assert spent < 120, f"brief target is <120 requests for such a run, spent {spent}"

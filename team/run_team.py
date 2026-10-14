@@ -31,10 +31,14 @@ from __future__ import annotations
 import argparse
 import concurrent.futures as cf
 import hashlib
+import itertools
 import json
 import os
 import re
+import shutil
+import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -179,10 +183,20 @@ def compose_prompt(defn: Any, extra: str = "") -> str:
 
 
 def assert_disjoint(tasks: list[Task]) -> None:
-    """Two tasks that may run together must not claim the same path."""
+    """Two tasks that may run together must not claim the same path.
+
+    R5-D2: containment, not string equality. `tests/` and `tests/test_x.py` DO
+    overlap -- an exact-string compare passed that pair, and the resulting
+    parallel torn-write looked like a flaky test suite. One shared helper
+    (:func:`covers_path`) now answers overlap here and protected-path tampering
+    in the grading stage, so the two can never disagree about what "same file"
+    means.
+    """
     seen: dict[str, str] = {}
+    claims: list[tuple[str, str]] = []
     for task in tasks:
         for path in task.paths:
+            claims.append((task.id, path))
             owner = seen.get(path)
             if owner and owner != task.id:
                 raise TeamError(
@@ -190,9 +204,603 @@ def assert_disjoint(tasks: list[Task]) -> None:
                     "them or split the file. Running them together torn-writes it "
                     "and the damage only surfaces in someone else's test run.")
             seen[path] = task.id
+    for (id_a, a), (id_b, b) in itertools.combinations(claims, 2):
+        if id_a == id_b:
+            continue                      # one task naming its own path twice
+        if covers_path(a, b) or covers_path(b, a):
+            raise TeamError(
+                f"tasks {id_a} and {id_b} both claim {a!r} and {b!r}, which are "
+                "the same file or nested inside each other; serialise them or "
+                "split the file. Running them together torn-writes it and the "
+                "damage only surfaces in someone else's test run.")
+
+
+def norm_path(path: str | Path, root: str | Path | None = None) -> str:
+    """Absolute, normalised, symlink-resolved path, `./` and trailing `/` gone.
+
+    Every path comparison in this engine goes through here. Relative paths are
+    resolved against `root` (or the cwd), which is why a git-reported path
+    (always repo-root relative) and a task-declared path (workspace relative)
+    become comparable at all.
+    """
+    text = str(path or "").strip()
+    if not text:
+        return ""
+    if not os.path.isabs(text):
+        base = str(root) if root is not None else str(Path.cwd())
+        text = os.path.join(base, text)
+    return os.path.realpath(os.path.normpath(text))
+
+
+def covers_path(outer: str | Path, inner: str | Path, *,
+                root: str | Path | None = None) -> bool:
+    """True when `outer` IS `inner` or a parent DIRECTORY of it.
+
+    Containment, not prefix strings: `tests/` covers `tests/test_x.py`, `pkg`
+    does not cover `pkgfoo.py`. A declared directory covers everything under it
+    because an agent handed a directory owns its children.
+    """
+    a, b = norm_path(outer, root), norm_path(inner, root)
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    try:
+        return os.path.commonpath([a, b]) == a
+    except ValueError:
+        return False          # different drives/roots: never a containment
+
+
+
+# ------------------------------------------------------- R5: post-run grading
+# The discipline teamkit built in R1/R2, living in the engine so BOTH entry
+# points grade the same way. teamkit re-exports these (single implementation of
+# each) and keeps only the signatures its records API has always published.
+GRADE_TIMEOUT = 900
+#: The five outcome classes (R2). "The system failed" and "the system did
+#: nothing" are different diseases: a failed gate needs a better brief, a
+#: zero-work stall needs a lane fix.
+OUTCOMES = ("success", "partial_work", "abstained", "refused", "tie_kept")
+#: CLI exit map (documented in README): 0 pass-family, 1 failed gate, 2 tie (the
+#: work is not proven better than the incumbent) AND every refuse-before-spend
+#: path the CLI already had, 3 graded-run abort. Refusing before spend has always
+#: exited 2 here, and that behaviour is deliberately unchanged.
+EXIT_PASS = 0
+EXIT_GATE_FAIL = 1
+EXIT_TIE = 2
+EXIT_REFUSED = 2
+EXIT_ABORTED = 3
+
+
+def grade_exit_code(status: str | None, aborted: bool = False,
+                    failed_steps: int = 0) -> int:
+    """The CLI exit map for a graded run (documented in README).
+
+    0 only for the pass-family; GATE_FAIL is 1; a TIE is 2, because the work is
+    kept but not proven better; a graded run that aborted mid-flight is 3, which
+    is different damage from a failing gate. Refused-before-spend keeps the CLI's
+    pre-existing 2 at its own call sites.
+    """
+    if aborted:
+        return EXIT_ABORTED
+    if status in ("GATE_PASS", "GATE_PASS_NEW"):
+        return EXIT_PASS if not failed_steps else EXIT_GATE_FAIL
+    if status == "GATE_PASS_TIE":
+        return EXIT_TIE
+    if status == "RUN_DONE_NO_GATE":
+        return EXIT_PASS if not failed_steps else EXIT_GATE_FAIL
+    return EXIT_GATE_FAIL
+
+
+def git_root(workspace: str | Path) -> str | None:
+    """The work tree hosting `workspace` (walks up), or None when not a repo."""
+    try:
+        proc = subprocess.run(["git", "-C", str(workspace), "rev-parse",
+                               "--show-toplevel"], capture_output=True,
+                              text=True, timeout=60)
+    except Exception:
+        return None
+    out = (proc.stdout or "").strip()
+    return out if proc.returncode == 0 and out else None
+
+
+def _git_out(args: list[str], cwd: str | Path | None = None) -> str:
+    try:
+        proc = subprocess.run(args, cwd=str(cwd) if cwd else None,
+                              capture_output=True, text=True, timeout=120)
+        return proc.stdout.strip() if proc.returncode == 0 else ""
+    except Exception:
+        return ""
+
+
+def capture_baseline_ref(workspace: str | Path) -> str | None:
+    """Pristine baseline commit, captured BEFORE the team touches anything.
+
+    Dirty work tree -> `git stash create` (the object is created, never applied:
+    the user's workdir is not mutated). Clean -> HEAD. Untracked-only dirt
+    yields HEAD, which is the documented R1 semantics.
+    """
+    root = git_root(workspace)
+    if not root:
+        return None
+    if _git_out(["git", "-C", root, "status", "--porcelain"], root):
+        sc = _git_out(["git", "-c", "user.email=teamkit@local",
+                       "-c", "user.name=teamkit", "stash", "create"], root)
+        if sc:
+            return sc
+    return _git_out(["git", "-C", root, "rev-parse", "HEAD"], root) or None
+
+
+def materialize_baseline(baseline_ref: str, workspace: str | Path):
+    """Pristine copy of `baseline_ref` in a temp dir, (dest, cleanup) or (None, None).
+
+    `git worktree add --detach` first; `git archive | tar -x` when a tree refuses
+    worktrees. Cleanup removes the tree AND prunes the internal worktree
+    registration, so the user's repo keeps exactly one worktree.
+    """
+    root = git_root(workspace)
+    if not root:
+        return None, None
+    dest = tempfile.mkdtemp(prefix="teamkit-baseline-",
+                            dir=os.environ.get("TEAMKIT_BASE_TMP") or None)
+    made_worktree = False
+
+    def cleanup():
+        if made_worktree:
+            subprocess.run(["git", "-C", root, "worktree", "remove", "--force",
+                            dest], capture_output=True, text=True)
+        else:
+            shutil.rmtree(dest, ignore_errors=True)
+        subprocess.run(["git", "-C", root, "worktree", "prune"],
+                       capture_output=True, text=True)
+
+    try:
+        proc = subprocess.run(["git", "-C", root, "worktree", "add", "--detach",
+                               dest, baseline_ref], capture_output=True, text=True)
+        if proc.returncode == 0:
+            made_worktree = True
+        else:
+            shutil.rmtree(dest, ignore_errors=True)
+            dest = tempfile.mkdtemp(prefix="teamkit-baseline-",
+                                    dir=os.environ.get("TEAMKIT_BASE_TMP") or None)
+            arc = subprocess.run(["git", "-C", root, "archive", "--format=tar",
+                                  baseline_ref], capture_output=True)
+            if arc.returncode != 0:
+                return None, None
+            tar = subprocess.run(["tar", "-x", "-C", dest], input=arc.stdout)
+            if tar.returncode != 0:
+                return None, None
+        rel = os.path.relpath(os.path.abspath(str(workspace)), root)
+        return (os.path.join(dest, rel) if rel and rel != "." else dest), cleanup
+    except Exception:
+        cleanup()
+        return None, None
+
+
+def run_gate(cmd: str, cwd: str | Path) -> dict[str, Any]:
+    """One gate command, timeout 900, cwd=workspace -> {ok, rc, ran, tail, error}."""
+    try:
+        proc = subprocess.run(cmd, shell=True, cwd=str(cwd), capture_output=True,
+                              text=True, timeout=GRADE_TIMEOUT)
+        return {"ok": proc.returncode == 0, "rc": proc.returncode, "ran": True,
+                "tail": ((proc.stdout or "")[-500:] + (proc.stderr or "")[-300:]),
+                "error": None}
+    except Exception as exc:
+        return {"ok": False, "rc": None, "ran": False, "tail": str(exc)[-500:],
+                "error": f"{type(exc).__name__}: {str(exc)[-300:]}"}
+
+
+def capture_workspace_state(workspace: str | Path) -> dict[str, Any]:
+    """READ-ONLY fingerprint of a repo: HEAD, tracked diff, dirt, digests.
+
+    R5-D2 work evidence is computed from two of these, taken BEFORE the gate so
+    a gate that runs a test suite cannot credit the team with __pycache__ dirt.
+    """
+    root = git_root(workspace)
+    if not root:
+        return {"root": None, "ws": str(workspace), "head": "", "tracked": "",
+                "porcelain": "", "tracked_sha": "", "porcelain_sha": ""}
+    porcelain = _git_out(["git", "-C", root, "status", "--porcelain", "-uall"],
+                         root)
+    tracked = _git_out(["git", "-C", root, "diff", "--no-color", "HEAD"], root)
+    return {"root": root, "ws": str(workspace),
+            "head": _git_out(["git", "-C", root, "rev-parse", "HEAD"], root),
+            "tracked": tracked, "tracked_sha": _sha(tracked),
+            "porcelain": porcelain, "porcelain_sha": _sha(porcelain)}
+
+
+def _sha(text: str) -> str:
+    return hashlib.sha256((text or "").encode("utf-8", "replace")).hexdigest()
+
+
+def work_evidence(base: dict | None, after: dict | None) -> dict[str, Any]:
+    """What the run produced between two fingerprints (R2 semantics)."""
+    base = base or {}
+    after = after or {}
+    b_head, a_head = base.get("head") or "", after.get("head") or ""
+    commits: int | None = None
+    if b_head and a_head:
+        if b_head == a_head:
+            commits = 0
+        else:
+            out = _git_out(["git", "-C", str(after.get("root")
+                                                  or base.get("root") or "."),
+                            "rev-list", "--count", f"{b_head}..{a_head}"])
+            try:
+                commits = int(out)
+            except ValueError:
+                commits = None
+    known = set((base.get("porcelain") or "").splitlines())
+    return {"commits": commits,
+            "tracked_changed": (base.get("tracked_sha") or "") !=
+                               (after.get("tracked_sha") or ""),
+            "dirt_changed": (base.get("porcelain_sha") or "") !=
+                            (after.get("porcelain_sha") or ""),
+            "new_dirt": [ln for ln in (after.get("porcelain") or "").splitlines()
+                         if ln and ln not in known],
+            "measurable": commits is not None}
+
+
+def has_work(ev: dict | None) -> bool:
+    """Evidence says the run left something behind. Unmeasurable is never
+    reported as 'did nothing' — we cannot prove the absence of work."""
+    if not ev or not ev.get("measurable"):
+        return True
+    return bool(ev.get("commits")) or bool(ev.get("tracked_changed")) or \
+        bool(ev.get("dirt_changed"))
+
+
+def _porcelain_paths(text: str) -> set[str]:
+    """Every path a `git status --porcelain` block mentions, first field wins.
+
+    Parsed rather than compared line-wise: porcelain's status column carries
+    leading spaces, and the whole block read by _git_out() is stripped, so a
+    line's exact text depends on whether it is first in the output. The path is
+    the only stable part. Renames report 'old -> new'; the new name is the one
+    that changed.
+    """
+    paths = set()
+    for ln in (text or "").splitlines():
+        ln = ln.rstrip()
+        if not ln:
+            continue
+        body = ln[2:] if len(ln) > 2 else ""
+        if " -> " in body:
+            body = body.split(" -> ", 1)[1]
+        path = body.strip().strip('"')
+        if path:
+            paths.add(path)
+    return paths
+
+
+def changed_paths(baseline: dict, after: dict, workspace: str | Path) -> list[str]:
+    """Every path this run could be blamed for: committed diff + working dirt.
+
+    Committed: `git diff --name-only <HEAD-at-start>..<HEAD-now>`. Uncommitted:
+    `git status --porcelain -uall` minus the paths already dirty at run start
+    (the owner's own edits are not the team's). Both are reported repo-root
+    relative and resolved to absolute paths here, because the comparison that
+    follows is containment, and containment needs one shared coordinate space.
+    """
+    root = after.get("root") or git_root(workspace)
+    if not root:
+        return []
+    paths: list[str] = []
+    base_head, after_head = baseline.get("head") or "", after.get("head") or ""
+    if base_head and after_head and base_head != after_head:
+        out = _git_out(["git", "-C", root, "diff", "--name-only",
+                        f"{base_head}..{after_head}"], root)
+        paths += [ln for ln in out.splitlines() if ln.strip()]
+    new_dirt = _porcelain_paths(after.get("porcelain")) - \
+        _porcelain_paths(baseline.get("porcelain"))
+    paths += sorted(new_dirt)
+    resolved, seen = [], set()
+    for p in paths:
+        ap = norm_path(p, root)
+        if ap and ap not in seen:
+            seen.add(ap)
+            resolved.append(ap)
+    return resolved
+
+
+def protect_violations(protect: list[str] | tuple[str, ...],
+                       tasks: list[Task], changed: list[str],
+                       root: str | Path,
+                       declared_paths: list[str] | None = None) -> list[str]:
+    """Changed paths that match a protect entry and no task's declared paths.
+
+    Containment both ways (D2): a protected directory protects its children, and
+    a task that declared that same directory is allowed to change inside it.
+    `declared_paths` adds declarations that come from outside the spec, namely
+    the runtime's own (a facade agent legitimately owns the workspace it runs
+    in). Returns '<protect entry>:<changed file>' for every violation, so the
+    status reason can name both sides of the breach.
+    """
+    bad: list[str] = []
+    claims = [claim for task in (tasks or []) for claim in task.paths]
+    claims += list(declared_paths or ())
+    for entry in protect or ():
+        if not str(entry).strip():
+            continue
+        for path in changed:
+            if not covers_path(entry, path, root=root):
+                continue
+            allowed = any(covers_path(claim, path, root=root) for claim in claims)
+            if not allowed:
+                bad.append(f"{entry}:{path}")
+    return bad
+
+
+def evaluate_grade(workspace: str | Path, contract: dict | None, *,
+                   tasks: list[Task] | None = None,
+                   baseline: dict | None = None,
+                   after: dict | None = None,
+                   baseline_ref: str | None = None,
+                   declared_paths: list[str] | None = None,
+                   ) -> dict[str, Any]:
+    """The deterministic grading stage: integrity check, gate, pair, outcome.
+
+    Runs AFTER the workflow, never inside an agent prompt. Order matters: the
+    protected-path integrity check happens BEFORE the gate and can fail the run
+    regardless of the gate's exit code, because an agent that rewrote the test
+    it was supposed to satisfy has not fixed anything.
+    """
+    contract = contract or {}
+    gate_cmd = contract.get("gate")
+    inc_cmd = contract.get("incumbent_gate")
+    protect = list(contract.get("protect") or ())
+    root = git_root(workspace) or str(Path(workspace).resolve())
+    out: dict[str, Any] = {"status": None, "gate": gate_cmd, "gate_tail": "",
+                           "pair": None, "outcome": None,
+                           "work_evidence": None, "protect": protect or None,
+                           "violations": []}
+    ev = work_evidence(baseline, after) if (baseline is not None and
+                                            after is not None) else None
+    out["work_evidence"] = ev
+
+    violations: list[str] = []
+    if protect and baseline is not None and after is not None:
+        changed = changed_paths(baseline, after, workspace)
+        violations = protect_violations(protect, tasks, changed, root,
+                                        declared_paths=declared_paths)
+    out["violations"] = violations
+
+    if not gate_cmd:
+        # A tamper check still outranks "there was no gate to run".
+        out["status"] = ("GATE_FAIL" if violations else "RUN_DONE_NO_GATE")
+        if violations:
+            out["reason"] = "protected-path-tampered:" + violations[0]
+        out["outcome"] = classify_outcome(out["status"], ev)
+        return out
+
+    if violations:
+        out["status"] = "GATE_FAIL"
+        out["reason"] = "protected-path-tampered:" + violations[0]
+        out["outcome"] = classify_outcome(out["status"], ev)
+        return out
+
+    r_new = run_gate(gate_cmd, workspace)
+    out["gate_tail"] = r_new["tail"]
+    if not inc_cmd:
+        # Legacy single-gate path: GATE_PASS is emitted only here.
+        out["status"] = "GATE_PASS" if r_new["ok"] else "GATE_FAIL"
+        out["outcome"] = classify_outcome(out["status"], ev)
+        return out
+
+    pair = None
+    baseline_ref = baseline_ref or capture_baseline_ref(workspace)
+    bdir, cleanup = None, None
+    r_base = {"ok": False, "rc": None, "tail": "", "ran": False,
+              "error": "no baseline ref: workspace is not a git work tree"}
+    try:
+        if baseline_ref:
+            bdir, cleanup = materialize_baseline(baseline_ref, workspace)
+            if bdir:
+                r_base = run_gate(inc_cmd, bdir)
+            else:
+                r_base = {"ok": False, "rc": None, "tail": "", "ran": False,
+                          "error": "baseline materialization failed"}
+    except Exception as exc:
+        r_base = {"ok": False, "rc": None, "tail": str(exc)[-500:], "ran": False,
+                  "error": f"{type(exc).__name__}: {str(exc)[-300:]}"}
+    finally:
+        if cleanup:
+            try:
+                cleanup()
+            except Exception:
+                pass
+    if not r_new["ok"]:
+        out["status"] = "GATE_FAIL"                    # incumbent retained
+    elif r_base["ok"]:
+        out["status"] = "GATE_PASS_TIE"                # matches the baseline
+    elif r_base["ran"]:
+        out["status"] = "GATE_PASS_NEW"                # proven improvement
+    else:
+        # A pair check that could not run proves nothing about the incumbent,
+        # so no improvement is claimed.
+        out["status"] = "GATE_PASS_TIE"
+    g_new = {"ok": r_new["ok"], "rc": r_new["rc"], "cmd": gate_cmd,
+             "error": r_new["error"]}
+    g_base = {"ok": r_base["ok"], "rc": r_base["rc"], "cmd": inc_cmd,
+              "error": r_base["error"], "ran": bool(r_base.get("ran", True))}
+    head_ref = _git_out(["git", "-C", root, "rev-parse", "HEAD"], root)
+    out["pair"] = {"g_new": g_new, "g_base": g_base,
+                   "baseline_ref": baseline_ref or None}
+    out["retained"] = {"accepted": bool(r_new["ok"]),
+                       "baseline_ref": baseline_ref or None,
+                       "head_ref": head_ref or None,
+                       "g_new": g_new, "g_base": g_base}
+    out["gate_tail"] = (r_new["tail"] + "\n" + r_base["tail"])[-800:]
+    out["outcome"] = classify_outcome(out["status"], ev)
+    return out
+
+
+def classify_outcome(status: str | None, ev: dict | None) -> str:
+    """R2 split. With a work_evidence dict the abstained/partial_work question
+    is answered by git; without one, only the status-derived classes are safe.
+    """
+    if status in ("GATE_PASS", "GATE_PASS_NEW"):
+        return "success"
+    if status == "GATE_PASS_TIE":
+        return "tie_kept"
+    if status in ("BUDGET_REFUSED", "DRY_PLAN"):
+        return "refused"
+    if ev is None:
+        return "partial_work"
+    return "partial_work" if has_work(ev) else "abstained"
+
+
+# --------------------------------------------------- R5-D1: run records in the
+# engine. One runs/ tree for BOTH entry points: teamkit re-exports these names
+# rather than keeping a second implementation, so a record written by the CLI
+# and a record written by a netflow caller are the same object shape.
+RUNS_ROOT_DEFAULT = REPO / "runs"
+GRADE_STAGES = ("spec", "team_run", "gate", "lessons")
+
+
+class RunRecordError(RuntimeError):
+    """The record machinery failed in a way the caller must see."""
+
+
+def run_slug(workspace: str | Path) -> str:
+    """Slug = first 24 safe chars of basename(workspace)."""
+    name = os.path.basename(str(workspace).rstrip("/"))
+    return re.sub(r"[^A-Za-z0-9._-]", "", name)[:24]
+
+
+def unique_run_dir(runs_root: str | Path, slug: str) -> str:
+    """runs/<utc ts>-<slug>; a second run in the same second gets -2, -3 ..."""
+    ts = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    base = os.path.join(str(runs_root), f"{ts}-{slug}")
+    if not os.path.exists(base):
+        return base
+    n = 2
+    while os.path.exists(f"{base}-{n}"):
+        n += 1
+    return f"{base}-{n}"
+
+
+def pid_alive(pid: int) -> bool:
+    if pid == os.getpid():
+        return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True
+    return True
+
+
+def runs_root(explicit: str | Path | None = None) -> str:
+    return str(explicit or os.environ.get("TEAMKIT_RUNS_DIR")
+               or RUNS_ROOT_DEFAULT)
+
+
+def write_run_record(run_dir: str | Path, result: dict[str, Any], *,
+                    config: dict[str, Any] | None = None,
+                    state: dict[str, Any] | None = None,
+                    retained: dict[str, Any] | None = None) -> str:
+    """Persist summary.json (+ config/state/retained when given). Returns path."""
+    root = Path(run_dir)
+    root.mkdir(parents=True, exist_ok=True)
+    payload = {k: v for k, v in result.items()}
+    payload["run_dir"] = str(root)
+    for name, obj in (("config.json", config), ("state.json", state),
+                      ("summary.json", payload),
+                      ("retained.json", retained)):
+        if obj is None:
+            continue
+        tmp = root / (name + ".tmp")
+        tmp.write_text(json.dumps(obj, indent=1, sort_keys=True, default=str),
+                       encoding="utf-8")
+        os.replace(tmp, root / name)
+    return str(root)
 
 
 # ------------------------------------------------------------------ the team
+class TeamRuntime:
+    """The R5-D3 injection seam: how a Team loads roles, builds LLMs, runs work.
+
+    The default keeps the engine exactly as it was proven live: strict role-file
+    loading (RC1), router-resolved lane kwargs, one Conversation per role.
+    teamkit's facade passes a subclass that runs its agent force-refresh before
+    the first request, resolves the credential through `lib.keys` matched to the
+    lane's base URL, and hands a builder-mode task its own conversation, so ONE
+    engine and ONE grading path serve both entry points while each caller keeps
+    the rules it was born with.
+    """
+
+    def __init__(self) -> None:
+        #: Raise out of run_task instead of turning a crash into a failed result.
+        #: The facade sets it: teamkit's callers expect conv.run() blowups to
+        #: propagate, and the run record must say `ERROR`.
+        self.propagate_task_errors = False
+        #: The engine's RC1 promise: the three workflow roles must exist. A
+        #: runtime that registers its own definitions (teamkit) turns this off
+        #: and does the checking its own way.
+        self.strict_roles = True
+        #: R5-D3 builder mode: a single task to run in place of the workflow.
+        self.direct_task: Task | None = None
+        #: Extra text appended to the message a task is sent (contract + memory).
+        self.message_suffix = ""
+        #: Wholesale replacement for the task rendering (facade runs send the
+        #: brief + contract + memory block, not a rendered Task).
+        self.message_override: str | None = None
+        #: Keys merged into the router-resolved LLM kwargs (facade model
+        #: override and its credential resolution).
+        self.llm_overrides: dict[str, Any] = {}
+        #: Paths the RUNTIME itself owns in the workspace, so a facade agent
+        #: that legitimately writes its status file is not failed for it.
+        self.declared_paths: list[str] = []
+        #: Fired by a runtime that owns the conversation, exactly where its
+        #: agent touches the workspace (teamkit's test seam).
+        self.on_run: Callable[[str], None] | None = None
+        #: Recorded as `api_key_source` in config.json: how this runtime keys.
+        self.api_key_source = "lane"
+        #: Conversations this runtime built, newest last (orchestrator_final).
+        self.conversations: list[Any] = []
+
+    def load_defs(self, roles_dir: str | Path) -> list[Any]:
+        """Role definitions, with the RC3 registry warm-up the engine needs."""
+        ensure_tools_registered()
+        try:
+            return load_roles(roles_dir)
+        except RoleFileError as exc:
+            raise TeamError(f"role files rejected: {exc}") from exc
+
+    def preflight(self, team: "Team", iter_cap: int) -> dict[str, Any] | None:
+        """Run before the first request can be spent. Default: no-op.
+
+        Returns the `agents` block for config.json, or None.
+        """
+        return None
+
+    def llm_kwargs(self, team: "Team", role: str) -> dict[str, Any]:
+        """The LLM kwargs for one role. Default: exactly what the engine did."""
+        return team.router.llm_kwargs(role)
+
+    def build_llm(self, team: "Team", kwargs: dict[str, Any]):
+        from openhands.sdk import LLM
+
+        return LLM(**kwargs)
+
+    def prepare_task(self, team: "Team", task: "Task"):
+        """(conversation, llm, summary) when the runtime owns the whole run.
+
+        Default None: the engine builds the conversation from the role file.
+        """
+        return None
+
+    def record_api_key(self) -> str:
+        """The credential resolution this runtime uses, for the record.
+
+        'lib.keys' means the key was matched to the lane's token-plan base URL
+        instead of being the first `api_key:` line in the owner's config.
+        """
+        return self.api_key_source
+
+
 class Team:
     """Role files + router lanes, ready to run in one workspace.
 
@@ -212,27 +820,59 @@ class Team:
 
     def __init__(self, workspace: str | Path, *, router: Router | None = None,
                  roles_dir: str | Path | None = None,
-                 max_requests: int | None = None, dry_run: bool = False):
+                 max_requests: int | None = None, dry_run: bool = False,
+                 contract: dict[str, Any] | None = None,
+                 grade: bool | None = None,
+                 runtime: TeamRuntime | None = None,
+                 runs_root: str | Path | None = None,
+                 record_name: str | None = None,
+                 record: bool | None = None):
         self.workspace = Path(workspace)
         if not self.workspace.is_dir():
             raise TeamError(f"workspace does not exist: {self.workspace}")
         self.router = router or Router.load()
         self.max_requests = max_requests
         self.dry_run = dry_run
+        #: R5-D3: how this team builds LLMs / prepares agents (see TeamRuntime).
+        self.runtime = runtime or TeamRuntime()
+        self.runs_root = runs_root
+        #: Name for the record payload (the engine calls it a report).
+        self.record_name = record_name
+        #: False => the CALLER writes the record (teamkit owns the slug lock and
+        #: the config.json shape); None/True => this engine writes one per run.
+        self._record = record
+        self.agent_summary: dict[str, Any] | None = None
+        #: R5-D1/D2: the grading contract ({gate, incumbent_gate, protect}).
+        #: Grading defaults ON as soon as a contract is handed over — an EMPTY
+        #: contract counts, because "the run finished and there was no gate to
+        #: run" is the RUN_DONE_NO_GATE verdict, not an ungraded run. Without a
+        #: contract at all the report stays byte-compatible with pre-R5.
+        self.contract = dict(contract) if contract is not None else None
+        self.grade = (self.contract is not None) if grade is None else bool(grade)
+        self.baseline: dict[str, Any] | None = None
+        self.baseline_ref: str | None = None
+        self.after_team: dict[str, Any] | None = None
+        self.tasks: list[Task] = []
         self.results: list[AgentResult] = []
         self._requests = 0
         self._spec_done = False
         self._seeded_spec = False
-        ensure_tools_registered()          # RC3: registry is empty until this
-        try:
-            defs = load_roles(roles_dir or ROLES_DIR)
-        except RoleFileError as exc:
-            raise TeamError(f"role files rejected: {exc}") from exc
+        # R5-D3: role loading goes through the runtime. The engine's own runtime
+        # warms the tool registry (RC3) and applies strict RC1 loading exactly as
+        # before; the facade's runtime skips that because it registers its own
+        # definitions and must not reject a builder run over a hollow md file.
+        defs = self.runtime.load_defs(roles_dir or ROLES_DIR)
         self.defs = {d.name: d for d in defs}
         missing = {"architect", "fixer", "reviewer"} - set(self.defs)
-        if missing:
+        if missing and not self._roles_optional():
             raise TeamError(f"role files missing: {sorted(missing)}")
         self.ceiling = self._ceiling()
+
+    def _roles_optional(self) -> bool:
+        """Builder mode (a direct task, no delegation) needs no role files, and
+        neither does a runtime that registers its own definitions (teamkit)."""
+        return (self.runtime.direct_task is not None
+                or not getattr(self.runtime, "strict_roles", True))
 
     def _ceiling(self) -> int:
         configured = int(self.router.budget.get("max_requests_per_team_run", 100))
@@ -296,7 +936,7 @@ class Team:
         defn = self.defs[name]
         role = self.role_for(name)
         lane = self.router.lane_for(role)
-        llm = self.router.build_llm(role)
+        llm = self.build_llm(role)
         prompt = compose_prompt(defn, extra_prompt)
         patched = defn.model_copy(update={"system_prompt": prompt})
         try:
@@ -305,6 +945,16 @@ class Team:
         except RoleFileError as exc:
             raise TeamError(f"role {name}: {exc}") from exc
         return agent, llm, lane
+
+    def build_llm(self, role: str):
+        """One LLM, resolved through this team's runtime (R5-D3).
+
+        The engine's default runtime asks the router for the role's lane kwargs.
+        teamkit's runtime overrides the model from its own `model` argument while
+        keeping every other knob from the same lane, and resolves the credential
+        against the lane's base URL rather than the first api_key in the config.
+        """
+        return self.runtime.build_llm(self, self.runtime.llm_kwargs(self, role))
 
     def conversation(self, name: str, *, extra_prompt: str = ""):
         """A Conversation bound to one role. Uses only factory-safe kwargs."""
@@ -401,7 +1051,9 @@ class Team:
                 "workspace. WRITE THE SPEC TO THE FILE " + str(spec_path) + " as "
                 "a JSON array of objects with keys: id, role, instruction, "
                 "paths (files that task alone may touch), acceptance (commands "
-                "that must exit 0). Paths must be DISJOINT across tasks or the "
+                "that must exit 0), depends_on (ids of tasks that must finish "
+                "before this one starts; omit or [] for none). Paths must be "
+                "DISJOINT across tasks or the "
                 "run will be refused. Then repeat the same array in a fenced "
                 "json block in your reply. Do not edit any other file."),
             paths=(str(spec_path),), acceptance=())
@@ -489,6 +1141,19 @@ class Team:
                       "reply_tasks": len(reply_tasks)}
         return tasks, source, validation
 
+    def message_for(self, task: Task) -> str:
+        """The text a task is sent as. Default: the engine's own rendering.
+
+        A facade run replaces it wholesale (`runtime.message_override`), because
+        teamkit's callers hand over a brief + contract + memory block, not a
+        rendered Task, and byte-compat on the message is their contract, not
+        this engine's.
+        """
+        override = getattr(self.runtime, "message_override", None)
+        if override is not None:
+            return override + self.runtime.message_suffix
+        return task.render() + self.runtime.message_suffix
+
     def run_task(self, task: Task) -> AgentResult:
         """Run one task through its role. This spends real requests."""
         role = task.role if task.role in self.defs else "fixer"
@@ -514,56 +1179,68 @@ class Team:
         events: list[str] = []
         texts: list[str] = []
         try:
-            from openhands.sdk import Conversation
+            prepared = self.runtime.prepare_task(self, task)
+            if prepared is not None:
+                # R5-D3: the runtime owns this conversation (teamkit's builder /
+                # orchestrator single call). The engine still accounts for it:
+                # same _charge, same ceiling, same record.
+                conv, llm, summary = prepared
+            else:
+                from openhands.sdk import Conversation
 
-            agent, llm, lane = self.build_agent(role)
+                agent, llm, lane = self.build_agent(role)
 
-            def on_event(event) -> None:
-                name = type(event).__name__
-                if name == "ActionEvent":
-                    action = getattr(event, "action", None)
-                    events.append(type(action).__name__)
-                    # FinishAction carries the reply in .message. An acting turn
-                    # does not also emit a MessageEvent with source=agent, so
-                    # without this the agent's final text is invisible. A live
-                    # run showed the symptom: the architect spent 6 requests and
-                    # produced a FileEditorAction, yet the report recorded
-                    # text_len=0: the reply-fallback had nothing to read, so a
-                    # 6-request architect step contributed nothing to the run.
-                    # run_workflow did warn and skip fixers rather than claim
-                    # success, but the reply itself was still unrecoverable.
-                    message = getattr(action, "message", None)
-                    if isinstance(message, str) and message.strip():
-                        texts.append(message)
-                elif name == "MessageEvent":
-                    if getattr(event, "source", "") != "agent":
-                        return
-                    msg = getattr(event, "llm_message", None)
-                    if msg is None:
-                        return
-                    for part in (msg.content or []):
-                        chunk = getattr(part, "text", "") or ""
-                        if chunk.strip():
-                            texts.append(chunk)
+                def on_event(event) -> None:
+                    name = type(event).__name__
+                    if name == "ActionEvent":
+                        action = getattr(event, "action", None)
+                        events.append(type(action).__name__)
+                        # FinishAction carries the reply in .message. An acting
+                        # turn does not also emit a MessageEvent with
+                        # source=agent, so without this the agent's final text is
+                        # invisible. A live run showed the symptom: the architect
+                        # spent 6 requests and produced a FileEditorAction, yet
+                        # the report recorded text_len=0: the reply-fallback had
+                        # nothing to read, so a 6-request architect step
+                        # contributed nothing to the run. run_workflow did warn
+                        # and skip fixers rather than claim success, but the reply
+                        # itself was still unrecoverable.
+                        message = getattr(action, "message", None)
+                        if isinstance(message, str) and message.strip():
+                            texts.append(message)
+                    elif name == "MessageEvent":
+                        if getattr(event, "source", "") != "agent":
+                            return
+                        msg = getattr(event, "llm_message", None)
+                        if msg is None:
+                            return
+                        for part in (msg.content or []):
+                            chunk = getattr(part, "text", "") or ""
+                            if chunk.strip():
+                                texts.append(chunk)
 
-            conv = Conversation(agent=agent, workspace=str(self.workspace),
-                                callbacks=[on_event],
-                                **self.router.public_conversation_kwargs(
-                                    self.role_for(role)))
+                conv = Conversation(agent=agent, workspace=str(self.workspace),
+                                    callbacks=[on_event],
+                                    **self.router.public_conversation_kwargs(
+                                        self.role_for(role)))
+                summary = f"lane={lane.name} model={lane.model}"
             self._charge()                       # reserve 1 request before send
-            conv.send_message(task.render())
+            conv.send_message(self.message_for(task))
             conv.run()
             # One usage entry per completion: that is the real number of paid
             # requests, which is what this plan bills (not tokens, not tasks).
-            calls = len(getattr(llm.metrics, "token_usages", []) or []) or 1
+            metrics = getattr(llm, "metrics", None)
+            calls = len(getattr(metrics, "token_usages", []) or []) or 1
             self._settle(calls)
             self.router.record(self.role_for(role), calls)
             return AgentResult(id=task.id, role=role, ok=True, requests=calls,
                                actions=events, text="".join(texts),
-                               summary=f"lane={lane.name} model={lane.model}")
+                               summary=summary)
         except TeamError:
             raise
         except Exception as exc:
+            if self.runtime.propagate_task_errors:
+                raise
             return AgentResult(id=task.id, role=role, ok=False, actions=events,
                                text="".join(texts),
                                error=f"{type(exc).__name__}: {str(exc)[:200]}")
@@ -607,6 +1284,153 @@ class Team:
         return results
 
     def run_workflow(self, brief_path: str | Path, *,
+                     spec_parser: Callable[[str], list[Task]] | None = None,
+                     spec_file: str | Path | None = None,
+                     on_run: Callable[[str], None] | None = None,
+                     ) -> dict[str, Any]:
+        """One engine, two shapes, and (R5-D1) a graded tail.
+
+        Architect mode is the proven flow: spec -> disjoint parallel fixers ->
+        reviewer. Builder mode (`runtime.direct_task`, what teamkit's
+        `roles='none'` maps to) runs ONE task directly through the same
+        accounting. Both shapes then go through the SAME post-run grading stage:
+        protected-path integrity, component gate, optional pair gate against the
+        run-start baseline, outcome split, and a run record.
+
+        `on_run` is a test seam, called at the point where a live team has just
+        finished editing the workspace and before the work evidence is
+        fingerprinted, exactly where teamkit's own runs put conv.run().
+        """
+        self._begin_run()
+        if self.dry_run:
+            report = self._run_architect_workflow(
+                brief_path, spec_parser=spec_parser, spec_file=spec_file)
+        elif isinstance(self.runtime.direct_task, Task):
+            report = self._run_direct(self.runtime.direct_task)
+        else:
+            report = self._run_architect_workflow(
+                brief_path, spec_parser=spec_parser, spec_file=spec_file)
+        if self.dry_run:
+            return report
+        return self._grade_run(report, on_run=on_run)
+
+    # -- R5-D1: the graded tail -----------------------------------------
+    def _begin_run(self) -> None:
+        """Everything that must happen before the first request can be spent.
+
+        The fingerprints are taken HERE, not at grading time: the bar the work is
+        measured against is the world as the run found it, so a team that commits
+        cannot move it. `capture_workspace_state` is read-only (no stash, no
+        dangling object) and runs on every path; the `stash create` ref is only
+        taken when a pair check will actually use it.
+        """
+        ws = str(self.workspace)
+        self.baseline = capture_workspace_state(ws)
+        self.baseline_ref = None
+        if (self.contract or {}).get("incumbent_gate"):
+            try:
+                self.baseline_ref = capture_baseline_ref(ws)
+            except Exception:
+                self.baseline_ref = None
+        iter_cap = getattr(self.runtime, "iter_cap", None) or max(
+            1, int(self.ceiling) * 3)
+        if not self.dry_run:
+            self.agent_summary = self.runtime.preflight(self, iter_cap)
+
+    def _grade_run(self, report: dict[str, Any], *,
+                   on_run: Callable[[str], None] | None = None) -> dict[str, Any]:
+        """The post-workflow grading stage. No agent prose is ever evidence."""
+        ws = str(self.workspace)
+        if on_run:
+            on_run(ws)
+        # Fingerprints BEFORE the gate: a gate that runs a test suite creates
+        # __pycache__/.pytest_cache dirt of its own, and crediting the team with
+        # it would relabel a stalled run as partial_work.
+        self.after_team = capture_workspace_state(ws)
+        if not self.grade:
+            report["graded"] = False
+            return report
+        graded = evaluate_grade(ws, self.contract, tasks=self.tasks,
+                                baseline=self.baseline, after=self.after_team,
+                                baseline_ref=self.baseline_ref,
+                                declared_paths=list(getattr(
+                                    self.runtime, "declared_paths", ()) or ()))
+        report.update({
+            "graded": True,
+            "status": graded["status"],
+            "gate": graded["gate"],
+            "gate_tail": graded["gate_tail"],
+            "pair": graded["pair"],
+            "outcome": graded["outcome"],
+            "work_evidence": graded["work_evidence"],
+            "protect": graded.get("protect"),
+            "violations": graded.get("violations") or [],
+        })
+        if graded.get("reason"):
+            report["reason"] = graded["reason"]
+        if graded.get("retained") is not None:
+            # v2 runs only: what was kept and why, for retained.json (R1).
+            report["retained"] = graded["retained"]
+        report["run_dir"] = self._write_record(report, graded)
+        return report
+
+    def _write_record(self, report: dict[str, Any],
+                      graded: dict[str, Any]) -> str | None:
+        """A run record per graded run, into the ONE runs/ tree both engines use.
+
+        teamkit passes record=False and writes the record itself, because it owns
+        the per-slug lock; the CLI passes nothing and gets a plain record here.
+        """
+        if self._record is False:
+            return None
+        try:
+            root = runs_root(self.runs_root)
+            slug = run_slug(self.workspace) or "workspace"
+            run_dir = unique_run_dir(root, slug)
+            config = {"run_dir": run_dir, "workspace": str(self.workspace),
+                      "ceiling": self.ceiling, "contract": self.contract,
+                      "dry_run": self.dry_run,
+                      "brief_sha256": _sha(str(report.get("spec_file") or "")),
+                      "requests_charged": report.get("requests_charged"),
+                      "engine": "team",
+                      "api_key_source": self.runtime.record_api_key()}
+            if getattr(self, "agent_summary", None):
+                config["agents"] = self.agent_summary
+            if getattr(self.runtime, "recall", None):
+                config["recall"] = self.runtime.recall
+            state = {name: {"status": "done"} for name in
+                     ("spec", "team_run", "gate", "lessons")}
+            if report.get("aborted"):
+                state["team_run"] = {"status": "fail"}
+            return write_run_record(run_dir, report, config=config, state=state,
+                                    retained=graded.get("retained"))
+        except Exception:
+            return None
+
+    def _run_direct(self, task: Task) -> dict[str, Any]:
+        """Builder mode (R5-D3): one task, no architect, same accounting.
+
+        The task the caller built IS the spec, so tasks_parsed is 1 and
+        spec_source says 'direct' rather than pretending a file was read.
+        """
+        stale = self.clear_stale_status_files()
+        report: dict[str, Any] = {"steps": [], "requests_charged": 0,
+                                  "spec_file": None,
+                                  "cleared_stale_status_files": stale,
+                                  "spec_source": "direct", "spec_attempts": 0,
+                                  "tasks_parsed": 1}
+        self.tasks = [task]
+        assert_disjoint([task])
+        result = self.run_task(task)
+        report["steps"].append(self._as_dict(result))
+        if not result.ok:
+            report["aborted"] = f"task {result.id} failed: {result.error}"
+        report["status_files"] = sorted(p.name
+                                        for p in self.workspace.glob("DONE*.md"))
+        report["requests_charged"] = self._requests
+        return report
+
+    def _run_architect_workflow(self, brief_path: str | Path, *,
                      spec_parser: Callable[[str], list[Task]] | None = None,
                      spec_file: str | Path | None = None,
                      ) -> dict[str, Any]:
@@ -695,6 +1519,7 @@ class Team:
             # other step can. A second failure keeps the previous behaviour
             # exactly: warn loudly, skip fixers, let the reviewer run anyway.
             tasks = resolve(spec_step())
+        self.tasks = tasks
         if not tasks:
             # Loud, never silent: an architect that produced no task list is a
             # failed step, and skipping fixers quietly would let the run report
@@ -865,6 +1690,20 @@ why --plan exists
                     help="print the router lane table; spends 0 requests")
     ap.add_argument("--max-requests", type=int, default=None,
                     help="hard ceiling for this run (must be <= router ceiling)")
+    ap.add_argument("--gate", default=None,
+                    help="component gate command run in the workspace AFTER the "
+                         "workflow; grading is what decides success, not prose")
+    ap.add_argument("--incumbent-gate", default=None,
+                    help="pair check: the same gate run against the run-start "
+                         "baseline, so improvement (not just green) passes")
+    # default=None, NOT []: argparse's append mutates the default list object,
+    # and main() is called repeatedly in one process by the CLI tests.
+    ap.add_argument("--protect", action="append", default=None, metavar="PATH",
+                    help="protect this path: a run that changes it without "
+                         "declaring it fails the gate regardless of exit code "
+                         "(repeatable)")
+    ap.add_argument("--no-record", action="store_true",
+                    help="skip the runs/ record for this CLI run")
     ap.add_argument("--config", default=None, help="alternate router.yaml")
     ap.add_argument("--roles-dir", default=None, help="alternate roles directory")
     ap.add_argument("--json", action="store_true", help="machine-readable output")
@@ -882,12 +1721,22 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(router.budget_report(), indent=2, default=str))
         return 0
 
+    contract: dict[str, Any] = {}
+    if args.gate:
+        contract["gate"] = args.gate
+    if args.incumbent_gate:
+        contract["incumbent_gate"] = args.incumbent_gate
+    if args.protect:
+        contract["protect"] = list(args.protect)
+    contract = contract or None
+
     try:
         team = Team(args.workspace, router=router, roles_dir=args.roles_dir,
-                    max_requests=args.max_requests, dry_run=args.dry_run)
+                    max_requests=args.max_requests, dry_run=args.dry_run,
+                    contract=contract, record=False if args.no_record else None)
     except TeamError as exc:
         print(f"REFUSED BEFORE SPEND: {exc}", file=sys.stderr)
-        return 2
+        return EXIT_REFUSED
 
     if args.dry_run:
         if not args.brief:
@@ -952,10 +1801,18 @@ def main(argv: list[str] | None = None) -> int:
     print(json.dumps(report, indent=2, default=str))
     failed = [s for s in report["steps"] if not s["ok"]]
     print(f"\nsteps={len(report['steps'])} failed={len(failed)} "
-          f"requests_charged={report['requests_charged']} ceiling={team.ceiling}")
+          f"requests_charged={report['requests_charged']} ceiling={team.ceiling}"
+          + (f" status={report.get('status')} outcome={report.get('outcome')}"
+             f" run_dir={report.get('run_dir')}" if report.get("graded") else ""))
     if report.get("warnings"):
         for w in report["warnings"]:
             print("WARNING: " + w)
+    if report.get("reason"):
+        print("REASON: " + str(report["reason"]))
+    if report.get("graded"):
+        return grade_exit_code(report.get("status"),
+                               aborted=bool(report.get("aborted")),
+                               failed_steps=len(failed))
     return 1 if failed or report.get("aborted") else 0
 
 

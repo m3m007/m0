@@ -108,14 +108,24 @@ def test_task_render_lists_paths_and_gates():
 
 
 def test_task_render_does_not_execute_gates():
-    """A gate string must stay inert data, never a shell command here."""
+    """A gate string must stay inert data, never a shell command mid-run.
+
+    R5 changed WHERE the gate runs, not what a rendered gate is: the acceptance
+    commands are still text handed to an agent, and the module's own subprocess
+    use is now confined to the post-workflow grading stage. So the structural
+    guarantee moves from "no subprocess import at all" to "no subprocess call
+    before the grading section", which is the same promise about the run itself.
+    """
     evil = Task(id="T1", role="fixer", instruction="x",
                 acceptance=("rm -rf / #",))
     assert "rm -rf" in evil.render()          # reported verbatim to the agent
-    # and nothing in this module imports subprocess/subprocess-exec for gates
     src = (REPO / "team" / "run_team.py").read_text(encoding="utf-8")
-    assert "import subprocess" not in src, "orchestrator must not shell out to gates"
     assert "os.system" not in src
+    head, _, _tail = src.partition("# ------------------------------------------------------- R5: post-run grading")
+    assert _tail, "the grading section marker must exist and be findable"
+    assert "subprocess.run" not in head, \
+        "the orchestrator must not shell out to gates during the run"
+    assert "import subprocess" in _tail or "import subprocess" in src
 
 
 # ---------------------------------------------------------------- stability
