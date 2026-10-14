@@ -161,7 +161,7 @@ def test_every_run_persists_config_state_summary(tmp_path, monkeypatch,
 
     cfg = json.loads((run_dir / "config.json").read_text())
     assert cfg["workspace"] == str(ws)
-    assert cfg["model"] == "openai/qwen3.8-flash"
+    assert cfg["model"] == tk.DEFAULT_MODEL_SHIPPED
     assert cfg["base_url"] == tk.TP_COMPAT
     assert cfg["budget_calls"] == 10
     assert cfg["contract"] == {"gate": "true"}, "contract recorded verbatim"

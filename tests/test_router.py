@@ -58,9 +58,10 @@ def test_implementer_is_the_flash_model(router):
 
 
 def test_architect_is_a_frontier_candidate(router):
-    """Brief allows glm-5.3 or deepseek-v4-pro once working; glm is verified here."""
+    """Shipped ids are placeholders; what must hold anywhere: anthropic-native,
+    probe-verified architect."""
     lane = router.lane_for("architect")
-    assert "glm-5.3" in lane.model
+    assert lane.model.startswith("anthropic/<lane-")
     assert lane.probes.raw_curl == "verified_here"
 
 
@@ -78,7 +79,7 @@ def test_role_pointing_at_missing_lane_is_a_config_error():
 
 
 def test_mismatched_prefix_and_url_is_refused_at_parse_time():
-    cfg = {"defaults": {}, "lanes": {"bad": {"model": "anthropic/glm-5.3",
+    cfg = {"defaults": {}, "lanes": {"bad": {"model": "anthropic/<lane-a>",
                                             "base_url": COMPATIBLE_BASE_URL}},
            "roles": {"bad": {"lane": "bad"}}}
     with pytest.raises(RouterError, match="requires base_url"):
@@ -169,7 +170,7 @@ def test_expiry_uses_real_dates():
 # ------------------------------------------------------------ building
 def test_llm_kwargs_are_coherent_and_secret_free(router):
     kwargs = router.llm_kwargs("architect")
-    assert kwargs["model"] == "anthropic/glm-5.3"
+    assert kwargs["model"] == "anthropic/<lane-a>"
     assert kwargs["base_url"] == ANTHROPIC_BASE_URL
     assert kwargs["streaming"] is False
     assert kwargs["temperature"] == pytest.approx(0.2)
@@ -187,7 +188,7 @@ def test_build_llm_produces_a_working_sdk_object(router):
 
     llm = router.build_llm("architect")
     assert isinstance(llm, LLM)
-    assert llm.model == "anthropic/glm-5.3"
+    assert llm.model == "anthropic/<lane-a>"
     from openhands.sdk.llm.utils.model_features import get_features
 
     assert get_features(llm.model).thinking_mode in ("none", "unknown", "manual")
@@ -335,14 +336,14 @@ def _cfg_with_lane(lane_spec: dict) -> dict:
 def test_enable_thinking_false_without_effort_override_is_refused():
     """The exact contradiction that killed the first live smoke run (HTTP 400:
     "'reasoning_effort' must be 'none' when 'enable_thinking' is false")."""
-    cfg = _cfg_with_lane({"model": "openai/qwen3.8-flash",
+    cfg = _cfg_with_lane({"model": "openai/<lane-c>",
                           "extra_body": {"enable_thinking": False}})
     with pytest.raises(RouterError, match="enable_thinking=false"):
         Router(cfg)
 
 
 def test_enable_thinking_false_with_effort_override_loads():
-    cfg = _cfg_with_lane({"model": "openai/qwen3.8-flash",
+    cfg = _cfg_with_lane({"model": "openai/<lane-c>",
                           "extra_body": {"enable_thinking": False},
                           "capability_overrides": {"supports_reasoning_effort": False}})
     lane = Router(cfg).lane_for("probe_lane")
@@ -350,13 +351,13 @@ def test_enable_thinking_false_with_effort_override_loads():
 
 
 def test_enable_thinking_true_needs_no_override():
-    cfg = _cfg_with_lane({"model": "openai/qwen3.8-max",
+    cfg = _cfg_with_lane({"model": "openai/<lane-d>",
                           "extra_body": {"enable_thinking": True}})
     assert Router(cfg).lane_for("probe_lane").extra_body["enable_thinking"] is True
 
 
 def test_no_extra_body_is_not_flagged():
-    cfg = _cfg_with_lane({"model": "anthropic/glm-5.3"})
+    cfg = _cfg_with_lane({"model": "anthropic/<lane-a>"})
     assert Router(cfg).lane_for("probe_lane")
 
 
@@ -395,7 +396,7 @@ def test_extra_body_still_travels_to_the_llm(router):
 
 def test_unknown_capability_key_is_carried_not_fatal(router):
     """The SDK ignores unknown override keys; a typo must not brick the config."""
-    cfg = _cfg_with_lane({"model": "anthropic/glm-5.3",
+    cfg = _cfg_with_lane({"model": "anthropic/<lane-a>",
                           "capability_overrides": {"supports_typo_here": True}})
     assert Router(cfg).lane_for("probe_lane").capability_overrides
 

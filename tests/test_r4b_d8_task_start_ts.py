@@ -116,7 +116,7 @@ def test_exported_before_any_conversation_exists(repo, monkeypatch):
     cfg = read_json(res, "config.json")
     assert seen_at_key and seen_at_key[0] == str(cfg["task_start_ts"]), seen_at_key
     assert int(seen_at_key[0]) >= before, seen_at_key
-    assert ("llm", "openai/qwen3.8-flash", tk.TP_COMPAT) in calls, calls
+    assert ("llm", "openai/<lane-c>", tk.TP_COMPAT) in calls, calls
     assert ("conversation", str(repo)) in calls, calls
     assert os.environ["TASK_START_TS"] == str(cfg["task_start_ts"])
 

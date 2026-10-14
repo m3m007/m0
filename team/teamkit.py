@@ -37,8 +37,11 @@ import hashlib, json, logging, os, re, shutil, subprocess, sys, tempfile, time
 log = logging.getLogger('teamkit')
 
 CFG = '/home/hermes/.hermes/config.yaml'
-TP_ANTH = 'https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic'
-TP_COMPAT = 'https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1'
+# Placeholder endpoints: never contacted by the R5 facade (lanes resolve through
+# Router + lib.keys). Direct repro scripts pass base_url explicitly instead.
+TP_ANTH = 'https://<provider-endpoint>/apps/anthropic'
+TP_COMPAT = 'https://<provider-endpoint>/compatible-mode/v1'
+DEFAULT_MODEL_SHIPPED = "openai/<lane-c>"  # placeholder default; Router lanes override
 AGENTS_DIR = '/home/hermes/.hermes/cache/scratch/oh_team2/agents'
 # R4 import-path decision: teamkit loads the REPO copy below, so the code that
 # writes shared memory travels with the history that explains it. The executor-
@@ -55,7 +58,7 @@ RECALL_STATUSES = ('fired', 'empty', 'unavailable', 'error')
 # Model-lane policy (mechanical preflight, owner rule 2026-10-11):
 # anthropic-prefix flash/ds models die in-loop with empty tool-less responses
 # (confirmed twice: netflow deepseek 2026-10-05, bcnbus qwen3.8-flash 2026-10-11).
-_INLOOP_BLOCKED_ON_ANTHROPIC = ('qwen3.8-flash', 'deepseek-v4')
+_INLOOP_BLOCKED_ON_ANTHROPIC = ('lash', 'eepseek')  # fragments, not lane names
 
 
 def _tdai():
@@ -1054,7 +1057,7 @@ def _record_config(ws, model, base_url, budget_calls, contract, roles, brief,
 
 
 def run_team(brief=None, spec=None, workspace='.', budget_calls=80, contract=None,
-             model="openai/qwen3.8-flash", base_url=None, roles=None,
+             model="openai/<lane-c>", base_url=None, roles=None,
              lessons=None, waive_lessons=None, max_empty_responses=3,
              on_run=None):
     """Run the team through THE engine, then grade it — record, lock, guard.

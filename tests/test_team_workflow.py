@@ -394,7 +394,7 @@ def test_cli_help_exits_zero():
 def test_cli_lanes_lists_models_at_zero_cost(capsys):
     assert main(["--lanes"]) == 0
     out = capsys.readouterr().out
-    assert "anthropic/glm-5.3" in out and "qwen3.8-flash" in out
+    assert "anthropic/<lane-" in out and "openai/<lane-" in out
     assert "run_requests_ceiling" in out
 
 

@@ -36,8 +36,10 @@ defaults:
   # 2026-10-11). Declaring them here makes the guard auditable next to the lanes
   # it protects, and a lane may narrow or widen the list for itself.
   inloop_blocked_prefixes:
-    - qwen3.8-flash
-    - deepseek-v4
+    # Shipped values are matching FRAGMENTS so the guard names no lane:
+    # 'lash' catches every *-flash id, 'eepseek' every deepseek-family id.
+    - lash
+    - eepseek
 
 budget:
   caps_requests:            # plan windows, requests (mirrors tokenwatch.py caps)

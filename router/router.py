@@ -30,6 +30,7 @@ import contextlib
 import datetime as dt
 import sys
 from dataclasses import dataclass, field
+import os
 from pathlib import Path
 from typing import Any
 
@@ -139,7 +140,14 @@ class Router:
     def load(cls, path: str | Path | None = None) -> "Router":
         import yaml
 
-        cfg_path = Path(path or DEFAULT_CONFIG)
+        if path is None:
+            # Shipped router.yaml carries placeholder lane ids. Operators opt their
+            # real file in via ROUTER_LOCAL_OVERRIDE=<path>; never read silently, so
+            # published-vs-local behavior stays explicit and testable.
+            _ov = os.environ.get("ROUTER_LOCAL_OVERRIDE", "").strip()
+            cfg_path = Path(_ov) if _ov else Path(DEFAULT_CONFIG)
+        else:
+            cfg_path = Path(path)
         if not cfg_path.is_file():
             raise RouterError(f"router config not found: {cfg_path}")
         data = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))

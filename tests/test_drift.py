@@ -297,7 +297,7 @@ def test_blocked_prefixes_are_declarative_in_router_yaml():
     """The hardcoded tuple is gone from the guard's path; the config is the source."""
     router = Router.load()
     declared = router.inloop_blocked_prefixes()
-    assert "qwen3.8-flash" in declared and "deepseek-v4" in declared
+    assert "lash" in declared and "eepseek" in declared
     cfg = dict(router.cfg)
     cfg["defaults"] = dict(cfg["defaults"])
     cfg["defaults"]["inloop_blocked_prefixes"] = ["only-this"]
